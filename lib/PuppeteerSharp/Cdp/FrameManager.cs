@@ -13,7 +13,6 @@ namespace PuppeteerSharp.Cdp
 {
     internal class FrameManager : IDisposable, IAsyncDisposable, IFrameProvider
     {
-        private const int TimeForWaitingForSwap = 200;
         private const string ChromeExtensionPrefix = "chrome-extension://";
         private static readonly string UtilityWorldName = "__puppeteer_utility_world__" + typeof(FrameManager).Assembly.GetName().Version.ToString();
 
@@ -37,7 +36,7 @@ namespace PuppeteerSharp.Cdp
             IssuesEnabled = issuesEnabled;
 
             Client.MessageReceived += Client_MessageReceived;
-            Client.Disconnected += (sender, e) => _ = OnClientDisconnectAsync();
+            Client.Disconnected += (sender, e) => _ = OnClientDisconnectAsync(client);
         }
 
         internal event EventHandler<FrameEventArgs> FrameAttached;
@@ -51,6 +50,8 @@ namespace PuppeteerSharp.Cdp
         internal event EventHandler<FrameEventArgs> FrameNavigatedWithinDocument;
 
         internal event EventHandler<FrameEventArgs> LifecycleEvent;
+
+        IPage IFrameProvider.Page => Page;
 
         internal CDPSession Client { get; private set; }
 
@@ -102,8 +103,7 @@ namespace PuppeteerSharp.Cdp
             var preloadScript = new CdpPreloadScript(mainFrame, response.Identifier, source);
             _scriptsToEvaluateOnNewDocument.TryAdd(response.Identifier, preloadScript);
 
-            await Task.WhenAll(
-                GetFrames().Select(frame => ((CdpFrame)frame).AddPreloadScriptAsync(preloadScript))).ConfigureAwait(false);
+            await ForEachFrameAsync(frame => frame.AddPreloadScriptAsync(preloadScript)).ConfigureAwait(false);
 
             return new NewDocumentScriptEvaluation(response.Identifier);
         }
@@ -144,15 +144,13 @@ namespace PuppeteerSharp.Cdp
         internal async Task AddExposedFunctionBindingAsync(Binding binding)
         {
             _bindings.Add(binding);
-            await Task.WhenAll(
-                GetFrames().Select(frame => ((CdpFrame)frame).AddExposedFunctionBindingAsync(binding))).ConfigureAwait(false);
+            await ForEachFrameAsync(frame => frame.AddExposedFunctionBindingAsync(binding)).ConfigureAwait(false);
         }
 
         internal async Task RemoveExposedFunctionBindingAsync(Binding binding)
         {
             _bindings.Remove(binding);
-            await Task.WhenAll(
-                GetFrames().Select(frame => ((CdpFrame)frame).RemoveExposedFunctionBindingAsync(binding))).ConfigureAwait(false);
+            await ForEachFrameAsync(frame => frame.RemoveExposedFunctionBindingAsync(binding)).ConfigureAwait(false);
         }
 
         internal void OnAttachedToTarget(CdpTarget target)
@@ -278,7 +276,7 @@ namespace PuppeteerSharp.Cdp
             }
 
             Client.MessageReceived += Client_MessageReceived;
-            Client.Disconnected += (sender, e) => _ = OnClientDisconnectAsync();
+            Client.Disconnected += (sender, e) => _ = OnClientDisconnectAsync(client);
 
             await InitializeAsync(client).ConfigureAwait(false);
             await NetworkManager.AddClientAsync(client).ConfigureAwait(false);
@@ -303,6 +301,22 @@ namespace PuppeteerSharp.Cdp
             var slashIndex = pathPart.IndexOf('/');
             return slashIndex == -1 ? pathPart : pathPart.Substring(0, slashIndex);
         }
+
+        /// <summary>
+        /// Whether an exception means the frame's own CDP session is gone.
+        /// Upstream only has to check for <c>TargetCloseError</c> because the JS session rejects
+        /// pending calls locally. Here the command can still reach the browser before we notice the
+        /// detach, so Chrome answers with a session/frame lookup error instead.
+        /// </summary>
+        /// <param name="ex">The exception raised by the per-frame call.</param>
+        /// <returns>Whether the error is caused by the session going away.</returns>
+        private static bool IsSessionGoneError(Exception ex)
+            => ex is TargetClosedException ||
+                ex.Message.Contains("Target closed", StringComparison.Ordinal) ||
+                ex.Message.Contains("Session closed", StringComparison.Ordinal) ||
+                ex.Message.Contains("Session detached", StringComparison.Ordinal) ||
+                ex.Message.Contains("Session with given id not found", StringComparison.Ordinal) ||
+                ex.Message.Contains("No frame with given id", StringComparison.Ordinal);
 
         private CdpFrame GetFrame(string frameId) => FrameTree.GetById(frameId);
 
@@ -576,9 +590,12 @@ namespace PuppeteerSharp.Cdp
                 RemoveFramesRecursively(frame.ChildFrames.First() as Frame);
             }
 
-            frame.Detach();
             FrameTree.RemoveFrame(frame);
             FrameDetached?.Invoke(this, new FrameEventArgs(frame));
+
+            // Needs to be last to ensure events are dispatched before
+            // any per-frame cleanup runs. Mirrors upstream PR #14430.
+            frame.Detach();
         }
 
         private void OnFrameAttached(CDPSession session, PageFrameAttachedResponse frameAttached)
@@ -630,6 +647,23 @@ namespace PuppeteerSharp.Cdp
             }
         }
 
+        private async Task ForEachFrameAsync(Func<CdpFrame, Task> action)
+        {
+            await Task.WhenAll(GetFrames().Select(async frame =>
+            {
+                var cdpFrame = (CdpFrame)frame;
+                try
+                {
+                    await action(cdpFrame).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (cdpFrame.IsOopFrame() && IsSessionGoneError(ex))
+                {
+                    // Only an out-of-process frame has a session of its own to lose.
+                    // Losing it mid-call must not fail the whole fan-out.
+                }
+            })).ConfigureAwait(false);
+        }
+
         private async Task CreateIsolatedWorldAsync(CDPSession session, string name)
         {
             var key = $"{session.Id}:{name}";
@@ -662,7 +696,7 @@ namespace PuppeteerSharp.Cdp
             }
         }
 
-        private async Task OnClientDisconnectAsync()
+        private async Task OnClientDisconnectAsync(CDPSession client)
         {
             try
             {
@@ -672,9 +706,17 @@ namespace PuppeteerSharp.Cdp
                     return;
                 }
 
-                if (Client.Connection.IsClosed)
+                // If the disconnected client is not the current one, it means a swap
+                // has already happened.
+                if (Client != client)
                 {
-                    // On connection disconnected remove all frames
+                    return;
+                }
+
+                if (Client.Connection.IsClosed || Page.IsClosed)
+                {
+                    // On connection disconnected or the page closed, we know
+                    // that activation will not happen.
                     RemoveFramesRecursively(mainFrame);
                     return;
                 }
@@ -684,13 +726,20 @@ namespace PuppeteerSharp.Cdp
                     RemoveFramesRecursively(child as Frame);
                 }
 
-                var swappedTcs = new TaskCompletionSource<bool>();
+                var swappedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-                mainFrame.FrameSwappedByActivation += (_, _) => swappedTcs.TrySetResult(true);
+                void OnFrameSwapped(object sender, EventArgs e) => swappedTcs.TrySetResult(true);
+                void OnPageClosed(object sender, EventArgs e) => swappedTcs.TrySetException(new PuppeteerException("Page closed"));
+
+                using var subscriptions = new DisposableActionsStack();
+                mainFrame.FrameSwappedByActivation += OnFrameSwapped;
+                subscriptions.Defer(() => mainFrame.FrameSwappedByActivation -= OnFrameSwapped);
+                Page.Close += OnPageClosed;
+                subscriptions.Defer(() => Page.Close -= OnPageClosed);
 
                 try
                 {
-                    await swappedTcs.Task.WithTimeout(TimeForWaitingForSwap).ConfigureAwait(false);
+                    await swappedTcs.Task.ConfigureAwait(false);
                 }
                 catch
                 {

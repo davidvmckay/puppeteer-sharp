@@ -10,7 +10,7 @@ using PuppeteerSharp.Helpers.Json;
 
 namespace PuppeteerSharp.Cdp
 {
-    internal class ChromeTargetManager : ITargetManager
+    internal class ChromeTargetManager : ITargetManager, IDisposable
     {
         private readonly List<string> _ignoredTargets = new();
         private readonly Connection _connection;
@@ -21,6 +21,8 @@ namespace PuppeteerSharp.Cdp
         private readonly ConcurrentDictionary<string, CdpTarget> _attachedTargetsBySessionId = new();
         private readonly ConcurrentDictionary<string, TargetInfo> _discoveredTargetsByTargetId = new();
         private readonly TaskCompletionSource<bool> _initializeCompletionSource = new();
+        private readonly DisposableActionsStack _subscriptions = new();
+        private readonly ConcurrentDictionary<ICDPSession, DisposableActionsStack> _attachmentSubscriptions = new();
 
         // IDs of tab targets detected while running the initial Target.setAutoAttach
         // request. These are the targets whose initialization we want to await for
@@ -60,7 +62,9 @@ namespace PuppeteerSharp.Cdp
             _allowList = allowList;
             _logger = _connection.LoggerFactory.CreateLogger<ChromeTargetManager>();
             _connection.MessageReceived += OnMessageReceived;
+            _subscriptions.Defer(() => _connection.MessageReceived -= OnMessageReceived);
             _connection.SessionDetached += Connection_SessionDetached;
+            _subscriptions.Defer(() => _connection.SessionDetached -= Connection_SessionDetached);
         }
 
         public event EventHandler<TargetChangedArgs> TargetAvailable;
@@ -85,6 +89,11 @@ namespace PuppeteerSharp.Cdp
                 ],
             }).ConfigureAwait(false);
 
+            // Exclude page targets from connection-level auto-attach so we attach to the
+            // owning tab first. The tab session then auto-attaches to its page child via
+            // the session-level setAutoAttach below, establishing the browser -> tab ->
+            // page session hierarchy. Page._tabId depends on this hierarchy (and Chrome's
+            // Extensions.triggerAction rejects targetIds that are not tab targets).
             await _connection.SendAsync(
                 "Target.setAutoAttach",
                 new TargetSetAutoAttachRequest()
@@ -92,6 +101,11 @@ namespace PuppeteerSharp.Cdp
                     WaitForDebuggerOnStart = true,
                     Flatten = true,
                     AutoAttach = true,
+                    Filter = new[]
+                    {
+                        new TargetSetDiscoverTargetsRequest.DiscoverFilter() { Type = "page", Exclude = true, },
+                        new TargetSetDiscoverTargetsRequest.DiscoverFilter(),
+                    },
                 }).ConfigureAwait(false);
 
             _initialAttachDone = true;
@@ -101,6 +115,60 @@ namespace PuppeteerSharp.Cdp
         }
 
         public IEnumerable<ITarget> GetChildTargets(ITarget target) => target.ChildTargets;
+
+        public bool IsUrlAllowed(string url)
+        {
+            var hasBlockList = _blockList != null && _blockList.Length > 0;
+            var hasAllowList = _allowList != null && _allowList.Length > 0;
+
+            if (!hasBlockList && !hasAllowList)
+            {
+                return true;
+            }
+
+            // Always allow internal or setup pages
+            if (string.IsNullOrEmpty(url) || url == "about:blank")
+            {
+                return true;
+            }
+
+            if (hasBlockList)
+            {
+                foreach (var pattern in _blockList)
+                {
+                    if (MatchesUrlPattern(url, pattern))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (hasAllowList)
+            {
+                foreach (var pattern in _allowList)
+                {
+                    if (MatchesUrlPattern(url, pattern))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            return true;
+        }
+
+        public void Dispose()
+        {
+            _subscriptions.Dispose();
+            foreach (var subscriptions in _attachmentSubscriptions.Values)
+            {
+                subscriptions.Dispose();
+            }
+
+            _attachmentSubscriptions.Clear();
+        }
 
         private static void ValidateUrlPatterns(string[] patterns)
         {
@@ -182,8 +250,26 @@ namespace PuppeteerSharp.Cdp
         }
 
         private void Connection_SessionDetached(object sender, SessionEventArgs e)
+            => RemoveAttachmentListeners(e.Session);
+
+        private void SetupAttachmentListeners(ICDPSession session)
         {
-            e.Session.MessageReceived -= OnMessageReceived;
+            var subscriptions = new DisposableActionsStack();
+            session.MessageReceived += OnMessageReceived;
+            subscriptions.Defer(() => session.MessageReceived -= OnMessageReceived);
+            if (!_attachmentSubscriptions.TryAdd(session, subscriptions))
+            {
+                subscriptions.Dispose();
+                throw new PuppeteerException("Attachment listeners already set up for this session.");
+            }
+        }
+
+        private void RemoveAttachmentListeners(ICDPSession session)
+        {
+            if (session != null && _attachmentSubscriptions.TryRemove(session, out var subscriptions))
+            {
+                subscriptions.Dispose();
+            }
         }
 
         private void OnTargetCreated(TargetCreatedResponse e)
@@ -297,6 +383,7 @@ namespace PuppeteerSharp.Cdp
 
             if (!_connection.IsAutoAttached(targetInfo.TargetId))
             {
+                await MaybeSetupNetworkBlockListAsync(session, targetInfo).ConfigureAwait(false);
                 return;
             }
 
@@ -310,6 +397,12 @@ namespace PuppeteerSharp.Cdp
 
             if (targetInfo.Type == TargetType.ServiceWorker)
             {
+                if (!IsUrlAllowed(targetInfo.Url))
+                {
+                    await BlockServiceWorkerRegistrationAsync(session).ConfigureAwait(false);
+                    return;
+                }
+
                 await SilentDetachAsync(session, parentConnection).ConfigureAwait(false);
                 if (_attachedTargetsByTargetId.ContainsKey(targetInfo.TargetId))
                 {
@@ -348,7 +441,7 @@ namespace PuppeteerSharp.Cdp
                 _targetsIdsForInit.Add(targetInfo.TargetId);
             }
 
-            session.MessageReceived += OnMessageReceived;
+            SetupAttachmentListeners(session);
 
             if (isExistingTarget)
             {
@@ -376,6 +469,7 @@ namespace PuppeteerSharp.Cdp
                 FinishInitializationIfReady(parentTarget.TargetId);
             }
 
+            // The browser might be shutting down here, so we ignore potential errors.
             try
             {
                 await Task.WhenAll(
@@ -385,7 +479,7 @@ namespace PuppeteerSharp.Cdp
                         Flatten = true,
                         AutoAttach = true,
                     }),
-                    MaybeSetupNetworkBlockListAsync(session),
+                    MaybeSetupNetworkBlockListAsync(session, targetInfo),
                     session.SendAsync("Runtime.runIfWaitingForDebugger")).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -449,50 +543,67 @@ namespace PuppeteerSharp.Cdp
             TargetGone?.Invoke(this, new TargetChangedArgs { Target = target });
         }
 
-        private bool IsUrlAllowed(string url)
+        // Blocks the registration of a disallowed service worker by failing every request it makes
+        // (including its own main script fetch) at the Fetch layer. Using Fetch interception rather
+        // than Network.emulateNetworkConditions is deliberate: a paused worker (waitForDebuggerOnStart)
+        // answers no CDP command until it is resumed, so we cannot await any setup before resuming;
+        // and offline emulation only sets a connectivity state that races the script fetch (and on some
+        // transports stalls it instead of failing it). Fetch.enable is queued ahead of
+        // runIfWaitingForDebugger on the same session (FIFO), so interception is active before the
+        // worker can fetch anything, and Fetch holds each request until we fail it — no race, no stall,
+        // deterministic across transports. This diverges from upstream (which uses offline emulation and
+        // only exercises headless+websocket in CI, so it never hits the race/stall).
+        private async Task BlockServiceWorkerRegistrationAsync(CDPSession session)
         {
-            var hasBlockList = _blockList != null && _blockList.Length > 0;
-            var hasAllowList = _allowList != null && _allowList.Length > 0;
-
-            if (!hasBlockList && !hasAllowList)
+            async void OnRequestPaused(object sender, MessageEventArgs e)
             {
-                return true;
-            }
-
-            // Always allow internal or setup pages
-            if (string.IsNullOrEmpty(url) || url == "about:blank")
-            {
-                return true;
-            }
-
-            if (hasBlockList)
-            {
-                foreach (var pattern in _blockList)
+                if (e.MessageID != "Fetch.requestPaused")
                 {
-                    if (MatchesUrlPattern(url, pattern))
-                    {
-                        return false;
-                    }
+                    return;
+                }
+
+                var paused = e.MessageData.ToObject<FetchRequestPausedResponse>();
+                try
+                {
+                    await session.SendAsync(
+                        "Fetch.failRequest",
+                        new FetchFailRequest
+                        {
+                            RequestId = paused.RequestId,
+                            ErrorReason = "BlockedByClient",
+                        }).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to fail blocked service worker request");
                 }
             }
 
-            if (hasAllowList)
+            session.MessageReceived += OnRequestPaused;
+
+            // Worker sessions buffer their method-events until a consumer flushes them (so a
+            // CdpWebWorker doesn't miss its init events). A blocked worker never becomes a
+            // CdpWebWorker, so nothing would ever flush — and the Fetch.requestPaused event we
+            // rely on here would stay buffered, leaving the worker's script fetch paused forever
+            // (registration hangs). Flush now that our listener is attached so requestPaused is
+            // delivered live.
+            session.FlushEarlyMessages();
+
+            try
             {
-                foreach (var pattern in _allowList)
-                {
-                    if (MatchesUrlPattern(url, pattern))
-                    {
-                        return true;
-                    }
-                }
-
-                return false;
+                await Task.WhenAll(
+                    session.SendAsync(
+                        "Fetch.enable",
+                        new FetchEnableRequest { Patterns = [new FetchEnableRequest.Pattern("*")] }),
+                    session.SendAsync("Runtime.runIfWaitingForDebugger")).ConfigureAwait(false);
             }
-
-            return true;
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to block service worker registration");
+            }
         }
 
-        private async Task MaybeSetupNetworkBlockListAsync(CDPSession session)
+        private async Task MaybeSetupNetworkBlockListAsync(CDPSession session, TargetInfo targetInfo)
         {
             var hasBlockList = _blockList != null && _blockList.Length > 0;
             var hasAllowList = _allowList != null && _allowList.Length > 0;
@@ -544,7 +655,18 @@ namespace PuppeteerSharp.Cdp
                 });
             }
 
-            await session.SendAsync(
+            // Workers do not have Network enabled by default; enable it before applying rules.
+            var needsNetwork = targetInfo.Type == TargetType.Worker
+                || targetInfo.Type == TargetType.ServiceWorker
+                || targetInfo.Type == TargetType.SharedWorker;
+
+            var tasks = new List<Task>();
+            if (needsNetwork)
+            {
+                tasks.Add(session.SendAsync("Network.enable"));
+            }
+
+            tasks.Add(session.SendAsync(
                 "Network.emulateNetworkConditionsByRule",
                 new NetworkEmulateNetworkConditionsByRuleRequest
                 {
@@ -552,7 +674,16 @@ namespace PuppeteerSharp.Cdp
                     // Only set it when using a blocklist; allowlist mode uses per-rule offline flags instead.
                     Offline = hasBlockList ? true : null,
                     MatchedNetworkConditions = matchedNetworkConditions.ToArray(),
-                }).ConfigureAwait(false);
+                }));
+
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to setup network block list");
+            }
         }
     }
 }

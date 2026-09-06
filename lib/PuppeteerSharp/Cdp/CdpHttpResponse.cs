@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using PuppeteerSharp.Cdp.Messaging;
+using PuppeteerSharp.Helpers;
 
 namespace PuppeteerSharp.Cdp;
 
@@ -34,7 +35,11 @@ public partial class CdpHttpResponse : Response<CdpHttpRequest>
         {
             foreach (var keyValue in headers)
             {
-                Headers[keyValue.Key] = keyValue.Value;
+                var headerName = keyValue.Key.ToLowerInvariant();
+
+                // See https://www.rfc-editor.org/rfc/rfc9110.html#name-field-order for
+                // the set-cookie exception.
+                Headers[headerName] = HttpUtils.NormalizeHeaderValue(headerName, keyValue.Value);
             }
         }
 

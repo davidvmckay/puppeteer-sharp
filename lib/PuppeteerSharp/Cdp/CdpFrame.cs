@@ -88,6 +88,13 @@ public class CdpFrame : Frame
             throw new ArgumentNullException(nameof(options));
         }
 
+        if (CdpPage != null && !CdpPage.IsUrlAllowed(url))
+        {
+            throw new NavigationException(
+                $"Navigation to {url} is blocked by blocklist/allowlist rules",
+                url);
+        }
+
         var referrer = string.IsNullOrEmpty(options.Referer)
             ? FrameManager.NetworkManager.ExtraHTTPHeaders?.GetValue(RefererHeaderName)
             : options.Referer;
@@ -170,20 +177,16 @@ public class CdpFrame : Frame
     }
 
     /// <inheritdoc/>
-    public override async Task SetContentAsync(string html, NavigationOptions options = null)
+    [Obsolete]
+    public override async Task SetContentAsync(string html, NavigationOptions options)
     {
         var waitUntil = options?.WaitUntil ?? new[] { WaitUntilNavigation.Load };
         var timeout = options?.Timeout ?? FrameManager.TimeoutSettings.NavigationTimeout;
 
-        // We rely upon the fact that document.open() will reset frame lifecycle with "init"
-        // lifecycle event. @see https://crrev.com/608658
-        await IsolatedRealm.EvaluateFunctionAsync(
-            @"html => {
-                    document.open();
-                    document.write(html);
-                    document.close();
-                }",
-            html).ConfigureAwait(false);
+        // We rely upon the fact that the document is reopened, which resets the
+        // frame lifecycle with an "init" lifecycle event.
+        // @see https://crrev.com/608658
+        await SetFrameContentAsync(html).ConfigureAwait(false);
 
         using var watcher = new LifecycleWatcher(FrameManager.NetworkManager, this, waitUntil, timeout);
         var watcherTask = await Task.WhenAny(
@@ -402,5 +405,17 @@ public class CdpFrame : Frame
         // Transform kebab-case to camelCase
         return string.IsNullOrEmpty(referrerPolicy) ? null :
             Regex.Replace(referrerPolicy, "-(.)", match => match.Groups[1].Value.ToUpperInvariant());
+    }
+
+    private async Task SetFrameContentAsync(string content)
+    {
+        // Writing the content from the page would go through document.write, which
+        // makes Chrome treat parser-blocking cross-site scripts in it as an
+        // intervention candidate and may block them outright.
+        await Client.SendAsync("Page.setDocumentContent", new PageSetDocumentContentRequest
+        {
+            FrameId = Id,
+            Html = content,
+        }).ConfigureAwait(false);
     }
 }

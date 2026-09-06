@@ -26,6 +26,7 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Threading.Tasks;
+using PuppeteerSharp.Helpers;
 
 namespace PuppeteerSharp.Bidi;
 
@@ -74,11 +75,7 @@ public class BidiHttpResponse : Response<BidiHttpRequest>
         };
 
         // Convert headers
-        Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var header in data.Headers)
-        {
-            Headers[header.Name] = header.Value.Value;
-        }
+        Headers = BuildHeaders(data.Headers);
     }
 
     // Internal constructor for synthetic responses (e.g., cached history navigation)
@@ -103,11 +100,7 @@ public class BidiHttpResponse : Response<BidiHttpRequest>
         FromCache = data.FromCache;
         RemoteAddress = new RemoteAddress { IP = string.Empty, Port = -1 };
 
-        Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var header in data.Headers)
-        {
-            Headers[header.Name] = header.Value.Value;
-        }
+        Headers = BuildHeaders(data.Headers);
     }
 
     /// <inheritdoc />
@@ -153,16 +146,36 @@ public class BidiHttpResponse : Response<BidiHttpRequest>
         return new BidiHttpResponse(data);
     }
 
+    // Combines duplicate header values with a newline before normalizing, so repeated
+    // headers (e.g. multiple Set-Cookie entries) are preserved instead of the last one
+    // silently overwriting the earlier ones.
+    private static Dictionary<string, string> BuildHeaders(IEnumerable<WebDriverBiDi.Network.ReadOnlyHeader> headers)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var header in headers)
+        {
+            var headerName = header.Name.ToLowerInvariant();
+            var value = result.TryGetValue(headerName, out var existingValue)
+                ? $"{existingValue}\n{header.Value.Value}"
+                : header.Value.Value;
+            result[headerName] = HttpUtils.NormalizeHeaderValue(headerName, value);
+        }
+
+        return result;
+    }
+
     private void Initialize()
     {
         if (_data.FromCache)
         {
             _request.FromMemoryCache = true;
 
-            // Only fire RequestServedFromCache if this URL hasn't already been reported.
-            // Firefox BiDi can send duplicate BeforeRequestSent events with different request IDs,
-            // each getting its own BidiHttpRequest, but we should only report the cache event once per URL.
-            if (_request.BidiPage.TryMarkCacheEventFired(_request.Url))
+            // Only fire RequestServedFromCache for the canonical request that actually emitted the
+            // Request event. Firefox BiDi sends duplicate BeforeRequestSent events with different
+            // request IDs for the same URL during navigation; on a cold load the phantom duplicate
+            // can report fromCache=true even though the real request was served from the network.
+            // Reporting that phantom would wrongly mark the resource as served from cache.
+            if (_request.RequestEventEmitted && _request.BidiPage.TryMarkCacheEventFired(_request.Url))
             {
                 ((Page)_request.Frame.Page).OnRequestServedFromCache(new RequestEventArgs(_request));
             }

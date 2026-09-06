@@ -243,6 +243,7 @@ namespace PuppeteerSharp
         /// - the `timeout` is exceeded during navigation.
         /// - the remote server does not respond or is unreachable.
         /// - the main resource failed to load.
+        /// - the URL is blocked by blocklist/allowlist rules.
         ///
         /// <see cref="GoToAsync(string, int?, WaitUntilNavigation[])"/> will not throw an error when any valid HTTP status code is returned by the remote server,
         /// including 404 "Not Found" and 500 "Internal Server Error".  The status code for such responses can be retrieved by calling <see cref="IResponse.Status"/>
@@ -317,7 +318,18 @@ namespace PuppeteerSharp
         /// <param name="options">The options.</param>
         /// <returns>Task.</returns>
         /// <seealso cref="IPage.SetContentAsync(string, NavigationOptions)"/>
-        Task SetContentAsync(string html, NavigationOptions options = null);
+        [System.Obsolete("Use SetContentAsync(string, SetContentOptions) instead. The networkidle0 and networkidle2 wait conditions never worked reliably with SetContent.")]
+        Task SetContentAsync(string html, NavigationOptions options);
+
+        /// <summary>
+        /// Sets the HTML markup to the page.
+        /// </summary>
+        /// <param name="html">HTML markup to assign to the page.</param>
+        /// <param name="options">The options. The <see cref="WaitUntilNavigation.Networkidle0"/> and
+        /// <see cref="WaitUntilNavigation.Networkidle2"/> wait conditions are not supported for SetContent.</param>
+        /// <returns>Task.</returns>
+        /// <seealso cref="IPage.SetContentAsync(string, SetContentOptions)"/>
+        Task SetContentAsync(string html, SetContentOptions options = null);
 
         /// <summary>
         /// Sends a <c>keydown</c>, <c>keypress</c>/<c>input</c>, and <c>keyup</c> event for each character in the text.

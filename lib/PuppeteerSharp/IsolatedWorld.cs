@@ -49,6 +49,8 @@ namespace PuppeteerSharp
             FrameUpdated();
         }
 
+        internal event EventHandler ContextCleared;
+
         /// <inheritdoc/>
         public override string Origin => _origin;
 
@@ -104,7 +106,7 @@ namespace PuppeteerSharp
             }
 
             // _worldId is the extension ID for extension worlds
-            var extensions = await ((IPage)((CdpFrame)Frame).FrameManager.Page).Browser.GetExtensionsAsync().ConfigureAwait(false);
+            var extensions = await ((IPage)((CdpFrame)Frame).FrameManager.Page).Browser.ExtensionsAsync().ConfigureAwait(false);
             extensions.TryGetValue(_worldId, out var extension);
             return extension;
         }
@@ -269,6 +271,7 @@ namespace PuppeteerSharp
             _context?.Dispose();
             _context = null;
             Frame?.ClearDocumentHandle();
+            ContextCleared?.Invoke(this, EventArgs.Empty);
         }
 
         internal void SetNewContext(

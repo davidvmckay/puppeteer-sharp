@@ -37,10 +37,15 @@ public class CdpBrowser : Browser
     private readonly ConcurrentDictionary<string, CdpBrowserContext> _contexts;
     private readonly ILogger<Browser> _logger;
     private readonly bool _handleDevToolsAsPage;
+    private readonly bool _hasNetworkRestrictions;
     private readonly bool _networkEnabled;
     private readonly Dictionary<string, Extension> _extensions = new();
     private readonly bool _issuesEnabled;
+
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Usage", "CA2213:DisposableFieldsShouldBeDisposed", Justification = "Disposed in Detach().")]
+    private readonly DisposableActionsStack _subscriptions = new();
     private Task _closeTask;
+    private Task<BrowserGetVersionResponse> _versionTask;
 
     internal CdpBrowser(
         SupportedBrowser browser,
@@ -75,6 +80,9 @@ public class CdpBrowser : Browser
         _contexts = new ConcurrentDictionary<string, CdpBrowserContext>(
             contextIds.Select(contextId =>
                 new KeyValuePair<string, CdpBrowserContext>(contextId, new(Connection, this, contextId))));
+
+        _hasNetworkRestrictions = (blockList != null && blockList.Length > 0) || (allowList != null && allowList.Length > 0);
+        Connection.RejectEmulateNetworkConditionsCalls = _hasNetworkRestrictions;
 
         if (browser == SupportedBrowser.Firefox)
         {
@@ -125,15 +133,17 @@ public class CdpBrowser : Browser
 
     /// <inheritdoc/>
     public override ITarget[] Targets()
-        => TargetManager.GetAvailableTargets().Values.ToArray();
+        => TargetManager.GetAvailableTargets().Values
+            .Where(IsTargetExposed)
+            .ToArray();
 
     /// <inheritdoc/>
     public override async Task<string> GetVersionAsync()
-        => (await Connection.SendAsync<BrowserGetVersionResponse>("Browser.getVersion").ConfigureAwait(false)).Product;
+        => (await GetVersionResponseAsync().ConfigureAwait(false)).Product;
 
     /// <inheritdoc/>
     public override async Task<string> GetUserAgentAsync()
-        => (await Connection.SendAsync<BrowserGetVersionResponse>("Browser.getVersion").ConfigureAwait(false)).UserAgent;
+        => (await GetVersionResponseAsync().ConfigureAwait(false)).UserAgent;
 
     /// <inheritdoc/>
     public override void Disconnect()
@@ -211,11 +221,11 @@ public class CdpBrowser : Browser
     }
 
     /// <inheritdoc/>
-    public override async Task<string> InstallExtensionAsync(string path)
+    public override async Task<string> InstallExtensionAsync(string path, ExtensionInstallOptions options = null)
     {
         var response = await Connection.SendAsync<ExtensionsLoadUnpackedResponse>(
             "Extensions.loadUnpacked",
-            new ExtensionsLoadUnpackedRequest { Path = path }).ConfigureAwait(false);
+            new ExtensionsLoadUnpackedRequest { Path = path, EnableInIncognito = options?.EnabledInIncognito ?? false }).ConfigureAwait(false);
         _extensions.Remove(response.Id);
         return response.Id;
     }
@@ -228,7 +238,7 @@ public class CdpBrowser : Browser
     }
 
     /// <inheritdoc/>
-    public override async Task<IReadOnlyDictionary<string, Extension>> GetExtensionsAsync()
+    public override async Task<IReadOnlyDictionary<string, Extension>> ExtensionsAsync()
     {
         var response = await Connection.SendAsync<ExtensionsGetExtensionsResponse>("Extensions.getExtensions")
             .ConfigureAwait(false);
@@ -254,6 +264,129 @@ public class CdpBrowser : Browser
         }
 
         return extensionsMap;
+    }
+
+    /// <inheritdoc/>
+    public override async Task<string> InstallPWAAsync(InstallPWAOptions options)
+    {
+        if (options == null)
+        {
+            throw new ArgumentNullException(nameof(options));
+        }
+
+        if (_hasNetworkRestrictions)
+        {
+            throw new PuppeteerException("PWA APIs are not supported when network restrictions are configured.");
+        }
+
+        await Connection.SendAsync(
+            "PWA.install",
+            new PWAInstallRequest { ManifestId = options.ManifestId, InstallUrlOrBundleUrl = options.InstallUrlOrBundleUrl }).ConfigureAwait(false);
+
+        if (options.DisplayMode.HasValue)
+        {
+            await Connection.SendAsync(
+                "PWA.changeAppUserSettings",
+                new PWAChangeAppUserSettingsRequest { ManifestId = options.ManifestId, DisplayMode = options.DisplayMode }).ConfigureAwait(false);
+        }
+
+        return options.ManifestId;
+    }
+
+    /// <inheritdoc/>
+    public override async Task UninstallPWAAsync(UninstallPWAOptions options)
+    {
+        if (options == null)
+        {
+            throw new ArgumentNullException(nameof(options));
+        }
+
+        if (_hasNetworkRestrictions)
+        {
+            throw new PuppeteerException("PWA APIs are not supported when network restrictions are configured.");
+        }
+
+        await Connection.SendAsync("PWA.uninstall", new PWAUninstallRequest { ManifestId = options.ManifestId }).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public override async Task<IPage> LaunchPWAAsync(LaunchPWAOptions options)
+    {
+        if (options == null)
+        {
+            throw new ArgumentNullException(nameof(options));
+        }
+
+        if (_hasNetworkRestrictions)
+        {
+            throw new PuppeteerException("PWA APIs are not supported when network restrictions are configured.");
+        }
+
+        // `PWA.launch` resolves with the id of the launched *tab* target. Tab targets sit above page targets
+        // in the target hierarchy and are not exposed through Targets(), so the returned id can't be awaited
+        // directly.
+        var response = await Connection.SendAsync<PWALaunchResponse>(
+            "PWA.launch",
+            new PWALaunchRequest { ManifestId = options.ManifestId, Url = options.Url }).ConfigureAwait(false);
+
+        var target = (CdpTarget)await WaitForTargetAsync(
+            candidate =>
+            {
+                var tab = TargetManager.GetAvailableTargets().GetValueOrDefault(response.TargetId);
+                if (tab?.Type != TargetType.Tab)
+                {
+                    return false;
+                }
+
+                return TargetManager.GetChildTargets(tab).Contains(candidate);
+            },
+            new WaitForOptions { Timeout = options.Timeout }).ConfigureAwait(false);
+
+        // The child page target can be discovered (and match the predicate above) before CDP has reported
+        // its real navigated URL, which would otherwise be picked up here with page.Url still empty. Wait
+        // for the target to be fully initialized (i.e. its URL populated) before creating the Page for it,
+        // matching the pattern used by CreateTargetInPageAsync/GetDevToolsTargetPageAsync.
+        await target.InitializedTask.ConfigureAwait(false);
+
+        var page = await target.PageAsync().ConfigureAwait(false);
+        if (page == null)
+        {
+            throw new PuppeteerException($"Failed to create a page for the launched PWA (manifestId = {options.ManifestId})");
+        }
+
+        // target.InitializedTask only guarantees the Target domain reported a URL. page.Url is populated by
+        // a separate, independently-timed pathway: target.PageAsync() above triggers a Page.getFrameTree
+        // call whose response can still carry an empty URL for the main frame even after InitializedTask
+        // resolved. If that happens, wait for the main frame to report its navigated URL via the
+        // FrameNavigated event before handing the page back, so callers never observe page.Url empty.
+        if (string.IsNullOrEmpty(page.Url))
+        {
+            await page.WaitForFrameAsync(
+                frame => frame == page.MainFrame && !string.IsNullOrEmpty(frame.Url),
+                new WaitForOptions { Timeout = options.Timeout }).ConfigureAwait(false);
+        }
+
+        return page;
+    }
+
+    /// <inheritdoc/>
+    public override async Task<PWAState> GetPWAStateAsync(GetPWAStateOptions options)
+    {
+        if (options == null)
+        {
+            throw new ArgumentNullException(nameof(options));
+        }
+
+        if (_hasNetworkRestrictions)
+        {
+            throw new PuppeteerException("PWA APIs are not supported when network restrictions are configured.");
+        }
+
+        var response = await Connection.SendAsync<PWAGetOsAppStateResponse>(
+            "PWA.getOsAppState",
+            new PWAGetOsAppStateRequest { ManifestId = options.ManifestId }).ConfigureAwait(false);
+
+        return new PWAState { BadgeCount = response.BadgeCount, FileHandlers = response.FileHandlers };
     }
 
     internal static async Task<CdpBrowser> CreateAsync(
@@ -353,6 +486,7 @@ public class CdpBrowser : Browser
 
         var targetId = (await Connection.SendAsync<TargetCreateTargetResponse>("Target.createTarget", createTargetRequest)
             .ConfigureAwait(false)).TargetId;
+
         var target = await WaitForTargetAsync(t => ((CdpTarget)t).TargetId == targetId).ConfigureAwait(false) as CdpTarget;
         await target!.InitializedTask.ConfigureAwait(false);
         return await target.PageAsync().ConfigureAwait(false);
@@ -409,28 +543,38 @@ public class CdpBrowser : Browser
         _contexts.TryRemove(contextId, out var _);
     }
 
+    private static bool IsTargetExposed(CdpTarget target)
+        => target.Type != TargetType.Tab && string.IsNullOrEmpty(target.TargetInfo.Subtype);
+
     private static bool IsDevToolsPageTarget(string url)
     {
         return url?.StartsWith("devtools://devtools/bundled/devtools_app.html", StringComparison.OrdinalIgnoreCase) == true;
     }
 
+    // The version is not expected to change, so cache it and only call Browser.getVersion once.
+    // This also avoids repeated calls when using Puppeteer with untrusted sessions.
+    private Task<BrowserGetVersionResponse> GetVersionResponseAsync()
+        => _versionTask ??= Connection.SendAsync<BrowserGetVersionResponse>("Browser.getVersion");
+
     private Task AttachAsync()
     {
         Connection.Disconnected += Connection_Disconnected;
+        _subscriptions.Defer(() => Connection.Disconnected -= Connection_Disconnected);
         TargetManager.TargetAvailable += OnAttachedToTargetAsync;
+        _subscriptions.Defer(() => TargetManager.TargetAvailable -= OnAttachedToTargetAsync);
         TargetManager.TargetGone += OnDetachedFromTargetAsync;
+        _subscriptions.Defer(() => TargetManager.TargetGone -= OnDetachedFromTargetAsync);
         TargetManager.TargetChanged += OnTargetChanged;
+        _subscriptions.Defer(() => TargetManager.TargetChanged -= OnTargetChanged);
         TargetManager.TargetDiscovered += TargetManager_TargetDiscovered;
+        _subscriptions.Defer(() => TargetManager.TargetDiscovered -= TargetManager_TargetDiscovered);
         return TargetManager.InitializeAsync();
     }
 
     private void Detach()
     {
-        Connection.Disconnected -= Connection_Disconnected;
-        TargetManager.TargetAvailable -= OnAttachedToTargetAsync;
-        TargetManager.TargetGone -= OnDetachedFromTargetAsync;
-        TargetManager.TargetChanged -= OnTargetChanged;
-        TargetManager.TargetDiscovered -= TargetManager_TargetDiscovered;
+        _subscriptions.Dispose();
+        TargetManager.Dispose();
     }
 
     private CdpTarget CreateTarget(TargetInfo targetInfo, CDPSession session, CDPSession parentSession)
@@ -544,9 +688,15 @@ public class CdpBrowser : Browser
 
     private void OnTargetChanged(object sender, TargetChangedArgs e)
     {
+        var target = (CdpTarget)e.Target;
+        if (!IsTargetExposed(target))
+        {
+            return;
+        }
+
         var args = new TargetChangedArgs(e.Target);
         OnTargetChanged(args);
-        ((CdpTarget)e.Target).BrowserContext.OnTargetChanged(args);
+        target.BrowserContext.OnTargetChanged(args);
     }
 
     private async void OnDetachedFromTargetAsync(object sender, TargetChangedArgs e)
@@ -556,6 +706,11 @@ public class CdpBrowser : Browser
             var target = (CdpTarget)e.Target;
             target.InitializedTaskWrapper.TrySetResult(InitializationStatus.Aborted);
             target.CloseTaskWrapper.TrySetResult(true);
+
+            if (!IsTargetExposed(target))
+            {
+                return;
+            }
 
             if ((await target.InitializedTask.ConfigureAwait(false)) == InitializationStatus.Success)
             {
@@ -577,6 +732,11 @@ public class CdpBrowser : Browser
         try
         {
             var target = (CdpTarget)e.Target;
+            if (!IsTargetExposed(target))
+            {
+                return;
+            }
+
             if (await target.InitializedTask.ConfigureAwait(false) == InitializationStatus.Success)
             {
                 var args = new TargetChangedArgs(e.Target);

@@ -23,6 +23,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
@@ -33,21 +34,25 @@ namespace PuppeteerSharp.Cdp;
 
 /// <summary>
 /// Experimental WebMCP API. Requires Chrome 149+ with
-/// --enable-features=WebMCPTesting,DevToolsWebMCPSupport flags.
+/// --enable-features=WebMCP flag.
 /// </summary>
 /// <seealso href="https://github.com/webmachinelearning/webmcp"/>
+[SuppressMessage(
+    "Microsoft.Design",
+    "CA1001:TypesThatOwnDisposableFieldsShouldBeDisposable",
+    Justification = "Listener subscriptions are disposed in UpdateClient via DisposableActionsStack.")]
 public class CdpWebMcp
 {
     private readonly FrameManager _frameManager;
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebMcpTool>> _tools = new();
     private readonly ConcurrentDictionary<string, WebMcpToolCall> _pendingCalls = new();
+    private DisposableActionsStack _subscriptions = new();
     private CDPSession _client;
 
     internal CdpWebMcp(CDPSession client, FrameManager frameManager)
     {
         _client = client;
         _frameManager = frameManager;
-        _frameManager.FrameNavigated += OnFrameNavigated;
         BindListeners();
     }
 
@@ -95,9 +100,24 @@ public class CdpWebMcp
         return response?.InvocationId;
     }
 
+    internal async Task CancelInvocationAsync(string invocationId)
+    {
+        try
+        {
+            await _client.SendAsync(
+                "WebMCP.cancelInvocation",
+                new { invocationId }).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Cancellation may fail if the invocation already completed.
+        }
+    }
+
     internal void UpdateClient(CDPSession newClient)
     {
-        UnbindListeners();
+        _subscriptions.Dispose();
+        _subscriptions = new DisposableActionsStack();
         _client = newClient;
         BindListeners();
     }
@@ -105,11 +125,7 @@ public class CdpWebMcp
     private void BindListeners()
     {
         _client.MessageReceived += OnMessageReceived;
-    }
-
-    private void UnbindListeners()
-    {
-        _client.MessageReceived -= OnMessageReceived;
+        _subscriptions.Defer(() => _client.MessageReceived -= OnMessageReceived);
     }
 
     private void OnMessageReceived(object sender, MessageEventArgs e)
@@ -142,7 +158,12 @@ public class CdpWebMcp
                 continue;
             }
 
+            var isNewFrame = !_tools.ContainsKey(tool.FrameId);
             var frameTools = _tools.GetOrAdd(tool.FrameId, _ => new ConcurrentDictionary<string, WebMcpTool>());
+            if (isNewFrame)
+            {
+                ListenToContextCleared(frame as CdpFrame);
+            }
 
             ConsoleMessageLocation location = null;
             if (tool.StackTrace?.CallFrames?.Length > 0)
@@ -238,9 +259,25 @@ public class CdpWebMcp
         ToolResponded?.Invoke(this, result);
     }
 
-    private void OnFrameNavigated(object sender, FrameNavigatedEventArgs e)
+    private void ListenToContextCleared(CdpFrame frame)
     {
-        var frameId = e.Frame?.Id;
+        var mainWorld = frame?.MainWorld;
+        if (mainWorld == null)
+        {
+            return;
+        }
+
+        EventHandler handler = null;
+        handler = (_, _) =>
+        {
+            mainWorld.ContextCleared -= handler;
+            OnContextCleared(frame.Id);
+        };
+        mainWorld.ContextCleared += handler;
+    }
+
+    private void OnContextCleared(string frameId)
+    {
         if (string.IsNullOrEmpty(frameId) || !_tools.TryGetValue(frameId, out var frameTools))
         {
             return;
@@ -255,19 +292,19 @@ public class CdpWebMcp
         }
     }
 
-    private class WebMcpToolsAddedProtocolEvent
+    internal class WebMcpToolsAddedProtocolEvent
     {
         [JsonPropertyName("tools")]
         public WebMcpProtocolTool[] Tools { get; set; }
     }
 
-    private class WebMcpToolsRemovedProtocolEvent
+    internal class WebMcpToolsRemovedProtocolEvent
     {
         [JsonPropertyName("tools")]
         public WebMcpProtocolRemovedTool[] Tools { get; set; }
     }
 
-    private class WebMcpToolInvokedProtocolEvent
+    internal class WebMcpToolInvokedProtocolEvent
     {
         [JsonPropertyName("frameId")]
         public string FrameId { get; set; }
@@ -282,7 +319,7 @@ public class CdpWebMcp
         public string ToolName { get; set; }
     }
 
-    private class WebMcpToolRespondedProtocolEvent
+    internal class WebMcpToolRespondedProtocolEvent
     {
         [JsonPropertyName("errorText")]
         public string ErrorText { get; set; }
@@ -300,7 +337,7 @@ public class CdpWebMcp
         public string Status { get; set; }
     }
 
-    private class WebMcpProtocolAnnotation
+    internal class WebMcpProtocolAnnotation
     {
         [JsonPropertyName("autosubmit")]
         public bool? Autosubmit { get; set; }
@@ -312,7 +349,7 @@ public class CdpWebMcp
         public bool? UntrustedContent { get; set; }
     }
 
-    private class WebMcpProtocolRemovedTool
+    internal class WebMcpProtocolRemovedTool
     {
         [JsonPropertyName("frameId")]
         public string FrameId { get; set; }
@@ -321,7 +358,7 @@ public class CdpWebMcp
         public string Name { get; set; }
     }
 
-    private class WebMcpProtocolTool
+    internal class WebMcpProtocolTool
     {
         [JsonPropertyName("annotations")]
         public WebMcpProtocolAnnotation Annotations { get; set; }

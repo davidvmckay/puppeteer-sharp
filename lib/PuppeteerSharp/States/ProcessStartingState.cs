@@ -1,6 +1,6 @@
 using System;
 using System.Diagnostics;
-using System.Text;
+using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -37,14 +37,19 @@ namespace PuppeteerSharp.States
 
         protected virtual async Task StartCoreAsync(LauncherBase p)
         {
-            var output = new StringBuilder();
+            if (p.ExecutablePath == null || !File.Exists(p.ExecutablePath))
+            {
+                await p.CleanTempUserDataDirAsync().ConfigureAwait(false);
+                throw new ProcessException(
+                    $"Browser was not found at the configured executablePath ({p.ExecutablePath})");
+            }
+
             var usePipe = p.Options.Pipe;
 
             void OnProcessDataReceivedWhileStarting(object sender, DataReceivedEventArgs e)
             {
                 if (e.Data != null)
                 {
-                    output.AppendLine(e.Data);
                     var match = Regex.Match(e.Data, LineOutputExpression);
                     if (match.Success)
                     {
@@ -54,10 +59,13 @@ namespace PuppeteerSharp.States
             }
 
             void OnProcessExitedWhileStarting(object sender, EventArgs e)
-                => p.StartCompletionSource.TrySetException(new ProcessException($"Failed to launch browser! {output}"));
+                => p.StartCompletionSource.TrySetException(
+                    new ProcessException($"Failed to launch browser! {p.GetRecentLogs()}"));
 
             void OnProcessExited(object sender, EventArgs e) => StateManager.Exited.EnterFrom(p, StateManager.CurrentState);
 
+            // Always subscribe for DevTools endpoint discovery when not using pipes.
+            // Recent stderr lines are captured separately on LauncherBase for both modes.
             if (!usePipe)
             {
                 p.Process.ErrorDataReceived += OnProcessDataReceivedWhileStarting;
@@ -79,15 +87,15 @@ namespace PuppeteerSharp.States
 
                 await StateManager.Started.EnterFromAsync(p, this).ConfigureAwait(false);
 
+                // Always begin reading stderr so ProcessSingleton / Missing X server
+                // diagnostics are available, including when Pipe=true.
+                p.Process.BeginErrorReadLine();
+
                 if (usePipe)
                 {
                     // In pipe mode, there's no ws:// URL to wait for.
                     // The pipe transport is the connection mechanism.
                     p.StartCompletionSource.TrySetResult(string.Empty);
-                }
-                else
-                {
-                    p.Process.BeginErrorReadLine();
                 }
 
                 var timeout = p.Options.Timeout;

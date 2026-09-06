@@ -1,5 +1,12 @@
 [
   {
+    "comment": "On Windows, headful Chrome quits when the last tab/window is closed (OS behavior), so this test fails",
+    "testIdPattern": "[browser.spec] Browser specs Browser.process should keep connected after the last page is closed",
+    "platforms": ["win32"],
+    "parameters": ["chrome", "headful"],
+    "expectations": ["FAIL"]
+  },
+  {
     "comment": "This test verifies Windows-specific path resolution and should only run on Windows",
     "testIdPattern": "[chrome-data.spec] Chrome should resolve system executable path (windows)",
     "platforms": ["darwin", "linux"],
@@ -77,13 +84,6 @@
     "expectations": ["FAIL"]
   },
   {
-    "comment": "This is flaky on CI/CD",
-    "testIdPattern": "[worker.spec] Workers Page.workers",
-    "platforms": ["darwin", "linux", "win32"],
-    "parameters": ["chrome"],
-    "expectations": ["FAIL"]
-  },
-  {
     "comment": "This is passing on my machine but failing on CI/CD",
     "testIdPattern": "*should take fullPage screenshots*",
     "platforms": ["linux"],
@@ -137,6 +137,13 @@
     "testIdPattern": "[evaluation.spec] Evaluation specs Page.evaluate should throw when evaluation triggers reload",
     "platforms": ["linux", "win32"],
     "parameters": ["chrome", "cdp"],
+    "expectations": ["SKIP"]
+  },
+  {
+    "comment": "BidiWorkerTarget.CreateCDPSessionAsync always throws PuppeteerException(\"Not supported\") on Firefox, so this CDP-only regression test for #3517 does not apply there",
+    "testIdPattern": "[puppeteer-sharp] CDPSession should receive events on a service worker session created via CreateCDPSessionAsync",
+    "platforms": ["darwin", "linux", "win32"],
+    "parameters": ["firefox"],
     "expectations": ["SKIP"]
   }
 ]

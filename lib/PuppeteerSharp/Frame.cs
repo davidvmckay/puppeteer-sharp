@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using PuppeteerSharp.Helpers;
 using PuppeteerSharp.Input;
 using PuppeteerSharp.QueryHandlers;
@@ -75,7 +76,7 @@ namespace PuppeteerSharp
         /// <summary>
         /// Logger.
         /// </summary>
-        protected ILogger Logger { get; init; }
+        protected ILogger Logger { get; init; } = NullLogger.Instance;
 
         /// <inheritdoc/>
         public abstract Task<IResponse> GoToAsync(string url, NavigationOptions options);
@@ -305,7 +306,14 @@ namespace PuppeteerSharp
                 options?.ReplaceLoneSurrogates ?? false);
 
         /// <inheritdoc/>
-        public abstract Task SetContentAsync(string html, NavigationOptions options = null);
+        [System.Obsolete("Use SetContentAsync(string, SetContentOptions) instead. The networkidle0 and networkidle2 wait conditions never worked reliably with SetContent.")]
+        public abstract Task SetContentAsync(string html, NavigationOptions options);
+
+        /// <inheritdoc/>
+        public Task SetContentAsync(string html, SetContentOptions options = null)
+#pragma warning disable CS0618 // Type or member is obsolete
+            => SetContentAsync(html, options?.ToNavigationOptions());
+#pragma warning restore CS0618
 
         /// <inheritdoc/>
         public Task<string> GetTitleAsync() => IsolatedRealm.EvaluateExpressionAsync<string>("document.title");

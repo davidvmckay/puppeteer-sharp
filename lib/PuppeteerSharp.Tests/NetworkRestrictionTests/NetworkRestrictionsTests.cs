@@ -34,7 +34,7 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
         });
 
         Assert.That(error, Is.Not.Null);
-        Assert.That(error.Message, Does.Contain("net::ERR_INTERNET_DISCONNECTED"));
+        Assert.That(error.Message, Does.Contain("is blocked by blocklist/allowlist rules"));
     }
 
     [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should block window.location.href navigation to URLs in the blocklist")]
@@ -88,6 +88,74 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
         Assert.That(fetchError, Does.Contain("Failed to fetch"));
     }
 
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should fail service worker registration for blocklisted script URLs")]
+    public async Task ShouldFailServiceWorkerRegistrationForBlocklistedScriptUrls()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.BlockList = ["*://*:*/empty.html", "*://*:*/pptr.png", "*://*:*/serviceworkers/empty/sw.js"];
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        await using var page = await browser.NewPageAsync();
+
+        var allowedUrl = TestConstants.ServerUrl + "/title.html";
+        var blockedUrl = TestConstants.ServerUrl + "/serviceworkers/empty/sw.js";
+
+        await page.GoToAsync(allowedUrl);
+
+        var swError = await page.EvaluateFunctionAsync<string>(
+            @"async (url) => {
+                try {
+                    await navigator.serviceWorker.register(url);
+                    return null;
+                } catch (e) {
+                    return e.message;
+                }
+            }",
+            blockedUrl);
+
+        Assert.That(swError, Is.Not.Null.And.Not.Empty);
+        Assert.That(swError, Does.Contain("Failed to register a ServiceWorker"));
+    }
+
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions blocklist validation", "should fail fetch requests from within a service worker to URLs in the blocklist")]
+    public async Task ShouldFailFetchRequestsFromWithinServiceWorkerToUrlsInBlocklist()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.BlockList =
+        [
+            "*://*:*/serviceworkers/fetch/style.css",
+        ];
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        await using var context = await browser.CreateBrowserContextAsync();
+        var page = await context.NewPageAsync();
+
+        var allowedUrl = TestConstants.ServerUrl + "/serviceworkers/fetch/sw.html";
+        var blockedUrl = TestConstants.ServerUrl + "/serviceworkers/fetch/style.css";
+
+        await page.GoToAsync(allowedUrl);
+
+        var target = await context.WaitForTargetAsync(
+            t => t.Type == TargetType.ServiceWorker,
+            new WaitForOptions { Timeout = 3000 });
+
+        var worker = await target.WorkerAsync();
+
+        var fetchError = await worker.EvaluateFunctionAsync<string>(
+            @"async (url) => {
+                try {
+                    await fetch(url);
+                    return null;
+                } catch (e) {
+                    return e.message;
+                }
+            }",
+            blockedUrl);
+
+        Assert.That(fetchError, Is.Not.Null.And.Not.Empty);
+        Assert.That(fetchError, Does.Contain("Failed to fetch"));
+    }
+
     [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should prevent loading of blocklisted subresources (e.g., images)")]
     public async Task ShouldPreventLoadingOfBlocklistedSubresources()
     {
@@ -114,10 +182,11 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
 
         await page.GoToAsync(TestConstants.EmptyPage);
 
+        var idleTask = page.WaitForNetworkIdleAsync();
         await page.SetContentAsync(
             $@"<img src=""{blockedUrl}"" />
-               <link rel=""stylesheet"" href=""{allowedUrl}"" />",
-            new NavigationOptions { WaitUntil = [WaitUntilNavigation.Networkidle0] });
+               <link rel=""stylesheet"" href=""{allowedUrl}"" />");
+        await idleTask;
 
         Assert.That(failedRequests.ContainsKey(blockedUrl), Is.True);
         Assert.That(failedRequests[blockedUrl], Does.Contain("net::ERR_INTERNET_DISCONNECTED"));
@@ -156,20 +225,29 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
         }
     }
 
-    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should not block chrome://version/ even if it matches blocklist")]
-    public async Task ShouldNotBlockChromeVersionEvenIfItMatchesBlocklist()
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should block chrome://version/ when it matches blocklist")]
+    public async Task ShouldBlockChromeVersionWhenItMatchesBlocklist()
     {
-        const string chromeUrl = "chrome://version/";
+        const string blockedUrl = "chrome://version/";
         var options = TestConstants.DefaultBrowserOptions();
-        options.BlockList = [chromeUrl];
+        options.BlockList = [blockedUrl];
 
         await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
         await using var page = await browser.NewPageAsync();
 
-        await page.GoToAsync(chromeUrl);
+        Exception error = null;
+        await page.GoToAsync(blockedUrl).ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+            {
+                error = t.Exception?.InnerException ?? t.Exception;
+            }
 
-        // Navigation should succeed as chrome:// URLs usually bypass the network
-        Assert.That(page.Url, Is.EqualTo(chromeUrl));
+            return t;
+        });
+
+        Assert.That(error, Is.Not.Null);
+        Assert.That(error.Message, Does.Contain("is blocked by blocklist/allowlist rules"));
     }
 
     [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should only allow navigation to URLs in the allowlist")]
@@ -199,7 +277,7 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
 
         Assert.That(page.Url, Is.Not.EqualTo(blockedUrl));
         Assert.That(error, Is.Not.Null);
-        Assert.That(error.Message, Does.Contain("net::ERR_INTERNET_DISCONNECTED"));
+        Assert.That(error.Message, Does.Contain("is blocked by blocklist/allowlist rules"));
     }
 
     [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should block window.location.href navigation to URLs not in the allowlist")]
@@ -254,6 +332,35 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
         Assert.That(fetchError, Does.Contain("Failed to fetch"));
     }
 
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should fail service worker registration for script URLs not in the allowlist")]
+    public async Task ShouldFailServiceWorkerRegistrationForScriptUrlsNotInAllowlist()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.Allowlist = ["*://*:*/empty.html"];
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        await using var page = await browser.NewPageAsync();
+
+        var allowedUrl = TestConstants.ServerUrl + "/empty.html";
+        var blockedUrl = TestConstants.ServerUrl + "/serviceworkers/empty/sw.js";
+
+        await page.GoToAsync(allowedUrl);
+
+        var swError = await page.EvaluateFunctionAsync<string>(
+            @"async (url) => {
+                try {
+                    await navigator.serviceWorker.register(url);
+                    return null;
+                } catch (e) {
+                    return e.message;
+                }
+            }",
+            blockedUrl);
+
+        Assert.That(swError, Is.Not.Null.And.Not.Empty);
+        Assert.That(swError, Does.Contain("Failed to register a ServiceWorker"));
+    }
+
     [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should prevent loading of subresources not in the allowlist (e.g., images)")]
     public async Task ShouldPreventLoadingOfSubresourcesNotInAllowlist()
     {
@@ -280,10 +387,11 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
 
         await page.GoToAsync(TestConstants.EmptyPage);
 
+        var idleTask = page.WaitForNetworkIdleAsync();
         await page.SetContentAsync(
             $@"<img src=""{blockedUrl}"" />
-               <link rel=""stylesheet"" href=""{allowedUrl}"" />",
-            new NavigationOptions { WaitUntil = [WaitUntilNavigation.Networkidle0] });
+               <link rel=""stylesheet"" href=""{allowedUrl}"" />");
+        await idleTask;
 
         Assert.That(failedRequests.ContainsKey(blockedUrl), Is.True);
         Assert.That(failedRequests[blockedUrl], Does.Contain("net::ERR_INTERNET_DISCONNECTED"));
@@ -381,5 +489,212 @@ public class NetworkRestrictionsTests : PuppeteerBaseTest
         }
 
         Assert.That(error, Is.Not.Null);
+    }
+
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should block frame.goto when the destination is in the blocklist")]
+    public async Task ShouldBlockFrameGotoWhenDestinationIsInBlocklist()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.BlockList = ["*://*:*/empty.html"];
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        await using var page = await browser.NewPageAsync();
+
+        await page.GoToAsync(TestConstants.ServerUrl + "/frames/one-frame.html");
+        var frame = Array.Find(page.Frames, f => f != page.MainFrame);
+        Assert.That(frame, Is.Not.Null);
+
+        var blockedUrl = TestConstants.ServerUrl + "/empty.html";
+        Exception error = null;
+        await frame.GoToAsync(blockedUrl).ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+            {
+                error = t.Exception?.InnerException ?? t.Exception;
+            }
+
+            return t;
+        });
+
+        Assert.That(error, Is.Not.Null);
+        Assert.That(error.Message, Does.Contain("is blocked by blocklist/allowlist rules"));
+    }
+
+    [Test, PuppeteerTest("BrowserConnector.test", "BrowserConnector _connectToBrowser", "should reject blocklist for WebDriver BiDi connections")]
+    public void ShouldRejectBlocklistForWebDriverBiDiConnections()
+    {
+        var connectOptions = new ConnectOptions
+        {
+            BrowserWSEndpoint = "ws://localhost:1234",
+            Protocol = ProtocolType.WebdriverBiDi,
+            BlockList = ["https://example.com/*"],
+        };
+
+        var error = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await Puppeteer.ConnectAsync(connectOptions));
+
+        Assert.That(error.Message, Does.Contain("blocklist and allowlist are only supported with the CDP protocol"));
+    }
+
+    [Test, PuppeteerTest("BrowserConnector.test", "BrowserConnector _connectToBrowser", "should reject allowlist for WebDriver BiDi connections")]
+    public void ShouldRejectAllowlistForWebDriverBiDiConnections()
+    {
+        var connectOptions = new ConnectOptions
+        {
+            BrowserWSEndpoint = "ws://localhost:1234",
+            Protocol = ProtocolType.WebdriverBiDi,
+            Allowlist = ["https://example.com/*"],
+        };
+
+        var error = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await Puppeteer.ConnectAsync(connectOptions));
+
+        Assert.That(error.Message, Does.Contain("blocklist and allowlist are only supported with the CDP protocol"));
+    }
+
+    [Test, PuppeteerTest("FirefoxLauncher.test", "FirefoxLauncher launch", "should reject blocklist for the default Firefox WebDriver BiDi protocol")]
+    public void ShouldRejectBlocklistForDefaultFirefoxWebDriverBiDiProtocol()
+    {
+        var options = new LaunchOptions
+        {
+            Browser = SupportedBrowser.Firefox,
+            BlockList = ["https://example.com/*"],
+        };
+
+        var error = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await Puppeteer.LaunchAsync(options));
+
+        Assert.That(error.Message, Does.Contain("blocklist and allowlist are only supported with the CDP protocol"));
+    }
+
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should block iframe content from loading if the iframe URL is in the blocklist")]
+    public async Task ShouldBlockIframeContentFromLoadingIfTheIframeUrlIsInTheBlocklist()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.BlockList = ["*://*:*/frames/frame.html"];
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        await using var page = await browser.NewPageAsync();
+
+        await page.GoToAsync(TestConstants.ServerUrl + "/frames/one-frame.html");
+        var frame = Array.Find(page.Frames, f => f != page.MainFrame);
+        Assert.That(frame, Is.Not.Null);
+
+        var content = await frame.GetContentAsync();
+        Assert.That(content, Does.Not.Contain("Hi, I'm frame"));
+    }
+
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should block out-of-process iframe (OOPIF) content from loading if the iframe URL is in the blocklist")]
+    public async Task ShouldBlockOopifContentFromLoadingIfTheIframeUrlIsInTheBlocklist()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.BlockList = ["*://*:*/frames/frame.html"];
+        options.Args = ["--site-per-process"];
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        await using var page = await browser.NewPageAsync();
+
+        await page.GoToAsync(TestConstants.EmptyPage);
+        var frame = await FrameUtils.AttachFrameAsync(page, "frame1", TestConstants.CrossProcessHttpPrefix + "/frames/frame.html");
+        var content = await frame.GetContentAsync();
+        Assert.That(content, Does.Not.Contain("Hi, I'm frame"));
+        Assert.That(content, Does.Contain("ERR_INTERNET_DISCONNECTED"));
+    }
+
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions", "should block standard emulation reset when blocklist/allowlist is active")]
+    public async Task ShouldBlockStandardEmulationResetWhenBlocklistAllowlistIsActive()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.BlockList = ["*://*:*/empty.html"];
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        await using var page = await browser.NewPageAsync();
+
+        var session = await page.CreateCDPSessionAsync();
+
+        var sessionError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await session.SendAsync(
+                "Network.emulateNetworkConditions",
+                new
+                {
+                    offline = false,
+                    latency = 0,
+                    downloadThroughput = 0,
+                    uploadThroughput = 0,
+                }));
+
+        Assert.That(sessionError.Message, Does.Contain("Cannot reset network conditions: rule-based emulation is enabled."));
+
+        var pageError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await page.EmulateNetworkConditionsAsync(new NetworkConditions
+            {
+                Latency = 0,
+                Download = 0,
+                Upload = 0,
+            }));
+
+        Assert.That(pageError.Message, Does.Contain("Cannot reset network conditions: rule-based emulation is enabled."));
+    }
+
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions PWA validation blocklist", "should throw when calling PWA APIs")]
+    public async Task ShouldThrowWhenCallingPwaApisWithBlocklist()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.BlockList = ["*://*:*/empty.html"];
+        options.Pipe = true;
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        var manifestId = $"{TestConstants.ServerUrl}/pwa/";
+
+        var installError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.InstallPWAAsync(new InstallPWAOptions
+            {
+                ManifestId = manifestId,
+                InstallUrlOrBundleUrl = $"{TestConstants.ServerUrl}/pwa/index.html",
+            }));
+        Assert.That(installError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
+
+        var launchError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.LaunchPWAAsync(new LaunchPWAOptions { ManifestId = manifestId }));
+        Assert.That(launchError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
+
+        var uninstallError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.UninstallPWAAsync(new UninstallPWAOptions { ManifestId = manifestId }));
+        Assert.That(uninstallError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
+
+        var stateError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.GetPWAStateAsync(new GetPWAStateOptions { ManifestId = manifestId }));
+        Assert.That(stateError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
+    }
+
+    [Test, PuppeteerTest("network_restrictions.spec", "Network Restrictions PWA validation allowlist", "should throw when calling PWA APIs")]
+    public async Task ShouldThrowWhenCallingPwaApisWithAllowlist()
+    {
+        var options = TestConstants.DefaultBrowserOptions();
+        options.Allowlist = ["*://*:*/empty.html"];
+        options.Pipe = true;
+
+        await using var browser = await Puppeteer.LaunchAsync(options, TestConstants.LoggerFactory);
+        var manifestId = $"{TestConstants.ServerUrl}/pwa/";
+
+        var installError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.InstallPWAAsync(new InstallPWAOptions
+            {
+                ManifestId = manifestId,
+                InstallUrlOrBundleUrl = $"{TestConstants.ServerUrl}/pwa/index.html",
+            }));
+        Assert.That(installError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
+
+        var launchError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.LaunchPWAAsync(new LaunchPWAOptions { ManifestId = manifestId }));
+        Assert.That(launchError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
+
+        var uninstallError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.UninstallPWAAsync(new UninstallPWAOptions { ManifestId = manifestId }));
+        Assert.That(uninstallError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
+
+        var stateError = Assert.ThrowsAsync<PuppeteerException>(async () =>
+            await browser.GetPWAStateAsync(new GetPWAStateOptions { ManifestId = manifestId }));
+        Assert.That(stateError.Message, Does.Contain("PWA APIs are not supported when network restrictions are configured."));
     }
 }

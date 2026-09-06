@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
@@ -15,6 +16,7 @@ using PuppeteerSharp.Bidi;
 using PuppeteerSharp.BrowserData;
 using PuppeteerSharp.Cdp;
 using PuppeteerSharp.Cdp.Messaging;
+using PuppeteerSharp.Helpers;
 using PuppeteerSharp.Helpers.Json;
 #if !CDP_ONLY
 using WebDriverBiDi;
@@ -62,11 +64,6 @@ namespace PuppeteerSharp
                 throw new ArgumentNullException(nameof(options));
             }
 
-            if (options.BlockList != null && options.Allowlist != null)
-            {
-                throw new PuppeteerException("Cannot specify both blocklist and allowlist");
-            }
-
             EnsureSingleLaunchOrConnect();
             _browser = options.Browser;
 
@@ -79,6 +76,8 @@ namespace PuppeteerSharp
 
                 options.Protocol = ProtocolType.WebdriverBiDi;
             }
+
+            UrlRestrictionsValidator.AssertSupportedUrlRestrictions(options.Protocol, options.BlockList, options.Allowlist);
 
             var executable = options.ExecutablePath;
             if (executable == null)
@@ -201,15 +200,11 @@ namespace PuppeteerSharp
 
                     if (options.EnableExtensions is { Paths: { } extensionPaths })
                     {
-                        if (options.Browser != SupportedBrowser.Firefox)
-                        {
-                            throw new PuppeteerException(
-                                "Installing extensions via EnableExtensions paths is only supported with Firefox. " +
-                                "For Chrome, use EnableExtensions = true and pass --load-extension as an argument.");
-                        }
-
+                        var extensionsEnabledInIncognito = options.ExtensionsEnabledInIncognito ?? [];
                         await Task.WhenAll(
-                            extensionPaths.Select(path => browser.InstallExtensionAsync(path))).ConfigureAwait(false);
+                            extensionPaths.Select(path => browser.InstallExtensionAsync(
+                                path,
+                                new ExtensionInstallOptions { EnabledInIncognito = extensionsEnabledInIncognito.Contains(path) }))).ConfigureAwait(false);
                     }
 
                     if (options.WaitForInitialPage)
@@ -225,11 +220,15 @@ namespace PuppeteerSharp
                     browser?.Dispose();
 
                     var userDataDir = options.UserDataDir ?? Process.TempUserDataDir?.Path;
-                    if (userDataDir != null && IsBrowserAlreadyRunning(ex, userDataDir))
+                    if (userDataDir != null)
                     {
-                        throw new ProcessException(
-                            $"The browser is already running for {userDataDir}. Use a different UserDataDir or stop the running browser first.",
-                            ex);
+                        // Pipe mode does not wait on the DevTools endpoint, so stderr
+                        // ProcessSingleton lines can arrive slightly after the connection
+                        // failure. Wait briefly for the process to exit / flush logs.
+                        await Task.WhenAny(
+                            Process.ExitCompletionSource.Task,
+                            Task.Delay(500)).ConfigureAwait(false);
+                        ThrowIfBrowserAlreadyRunning(ex, userDataDir, Process);
                     }
 
                     throw new ProcessException("Failed to create connection", ex);
@@ -238,16 +237,15 @@ namespace PuppeteerSharp
             catch (Exception ex)
             {
                 await Process.KillAsync().ConfigureAwait(false);
+                await Process.CleanTempUserDataDirAsync().ConfigureAwait(false);
 
                 var userDataDir = options.UserDataDir ?? Process.TempUserDataDir?.Path;
-                if (userDataDir != null && IsBrowserAlreadyRunning(ex, userDataDir))
+                if (userDataDir != null)
                 {
-                    throw new ProcessException(
-                        $"The browser is already running for {userDataDir}. Use a different UserDataDir or stop the running browser first.",
-                        ex);
+                    ThrowIfBrowserAlreadyRunning(ex, userDataDir, Process);
                 }
 
-                if (IsMissingXServer(ex) && options.HeadlessMode == HeadlessMode.False)
+                if (IsMissingXServer(ex, Process) && options.HeadlessMode == HeadlessMode.False)
                 {
                     throw new ProcessException(
                         "Missing X server to start the headful browser. Either set Headless to true or use xvfb-run to run your Puppeteer script.",
@@ -277,9 +275,11 @@ namespace PuppeteerSharp
                 throw new PuppeteerException("Exactly one of browserWSEndpoint or browserURL must be passed to puppeteer.connect");
             }
 
+            UrlRestrictionsValidator.AssertSupportedUrlRestrictions(options.Protocol, options.BlockList, options.Allowlist);
+
             var browserWSEndpoint = string.IsNullOrEmpty(options.BrowserURL)
                 ? options.BrowserWSEndpoint
-                : await GetWSEndpointAsync(options.BrowserURL).ConfigureAwait(false);
+                : await GetWSEndpointAsync(options.BrowserURL, ConnectionOptionsHelper.GetEffectiveHeaders(options)).ConfigureAwait(false);
 
             if (options.Protocol == ProtocolType.WebdriverBiDi)
             {
@@ -293,9 +293,78 @@ namespace PuppeteerSharp
             return await ConnectCdpAsync(browserWSEndpoint, options).ConfigureAwait(false);
         }
 
-        private static bool IsBrowserAlreadyRunning(Exception ex, string userDataDir)
+        /// <summary>
+        /// Returns a path to a system-wide Chrome installation for the given release channel.
+        /// </summary>
+        /// <param name="browser">Browser to resolve. Only <see cref="SupportedBrowser.Chrome"/> is supported.</param>
+        /// <param name="channel">Release channel to look for on the system.</param>
+        /// <param name="validatePath">
+        /// If <c>true</c> (default), throws when no candidate exists.
+        /// If <c>false</c>, returns the first resolved candidate even when the file is missing.
+        /// </param>
+        /// <param name="platform">
+        /// Platform whose known install locations should be used.
+        /// Defaults to the current platform.
+        /// </param>
+        /// <returns>The first existing candidate, or the first resolved path when <paramref name="validatePath"/> is <c>false</c>.</returns>
+        internal static string ComputeSystemExecutablePath(
+            SupportedBrowser browser,
+            ChromeReleaseChannel channel,
+            bool validatePath = true,
+            Platform? platform = null)
         {
-            var message = ex.ToString();
+            if (browser != SupportedBrowser.Chrome)
+            {
+                throw new PuppeteerException($"System browser detection is not supported for {browser} yet.");
+            }
+
+            var paths = Chrome.ResolveSystemExecutablePaths(platform ?? BrowserFetcher.GetCurrentPlatform(), channel);
+
+            foreach (var path in paths)
+            {
+                if (File.Exists(path))
+                {
+                    return path;
+                }
+            }
+
+            if (!validatePath)
+            {
+                return paths[0];
+            }
+
+            throw new PuppeteerException(
+                $"Could not find Google Chrome executable for channel '{channel}' at:\n - {string.Join("\n - ", paths)}");
+        }
+
+        private static void ThrowIfBrowserAlreadyRunning(Exception ex, string userDataDir, LauncherBase process)
+        {
+            if (!IsBrowserAlreadyRunning(ex, userDataDir, process))
+            {
+                return;
+            }
+
+            // The browser reports the same ProcessSingleton failure whether another
+            // instance holds the lock or it simply cannot write to the profile
+            // directory, so check for the latter before blaming a running browser.
+            if (!IsWritableDirectory(userDataDir))
+            {
+                throw new ProcessException(
+                    $"The browser cannot write to {userDataDir}. Make the UserDataDir writable or use a different one.",
+                    ex);
+            }
+
+            throw new ProcessException(
+                $"The browser is already running for {userDataDir}. Use a different UserDataDir or stop the running browser first.",
+                ex);
+        }
+
+        private static bool IsBrowserAlreadyRunning(Exception ex, string userDataDir, LauncherBase process)
+        {
+            // Prefer recent stderr logs (available even under Pipe=true) over the
+            // exception text, matching upstream browserProcess.getRecentLogs().
+            var logs = process?.GetRecentLogs() ?? string.Empty;
+            var message = string.IsNullOrEmpty(logs) ? ex.ToString() : logs + "\n" + ex;
             if (message.Contains("Failed to create a ProcessSingleton for your profile directory", StringComparison.Ordinal))
             {
                 return true;
@@ -313,8 +382,32 @@ namespace PuppeteerSharp
             return false;
         }
 
-        private static bool IsMissingXServer(Exception ex)
-            => ex.ToString().Contains("Missing X server", StringComparison.Ordinal);
+        private static bool IsWritableDirectory(string directory)
+        {
+            if (!Directory.Exists(directory))
+            {
+                return true;
+            }
+
+            try
+            {
+                var testPath = Path.Combine(directory, $".puppeteer-write-test-{Guid.NewGuid():N}");
+                File.WriteAllText(testPath, string.Empty);
+                File.Delete(testPath);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsMissingXServer(Exception ex, LauncherBase process)
+        {
+            var logs = process?.GetRecentLogs() ?? string.Empty;
+            var message = string.IsNullOrEmpty(logs) ? ex.ToString() : logs + "\n" + ex;
+            return message.Contains("Missing X server", StringComparison.Ordinal);
+        }
 
 #if !CDP_ONLY
         private static async Task<BiDiDriver> CreateBidiDriverAsync(BidiOverCdpTransport transport, IConnectionOptions options)
@@ -423,11 +516,6 @@ namespace PuppeteerSharp
 
         private async Task<IBrowser> ConnectCdpAsync(string browserWSEndpoint, ConnectOptions options)
         {
-            if (options.BlockList != null && options.Allowlist != null)
-            {
-                throw new PuppeteerException("Cannot specify both blocklist and allowlist");
-            }
-
             CdpConnection connection = null;
             try
             {
@@ -466,7 +554,7 @@ namespace PuppeteerSharp
             }
         }
 
-        private async Task<string> GetWSEndpointAsync(string browserURL)
+        private async Task<string> GetWSEndpointAsync(string browserURL, Dictionary<string, string> headers)
         {
             try
             {
@@ -475,7 +563,18 @@ namespace PuppeteerSharp
                     string data;
                     using (var client = new HttpClient())
                     {
-                        data = await client.GetStringAsync(endpointURL).ConfigureAwait(false);
+                        using var request = new HttpRequestMessage(HttpMethod.Get, endpointURL);
+                        if (headers != null)
+                        {
+                            foreach (var header in headers)
+                            {
+                                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                            }
+                        }
+
+                        using var response = await client.SendAsync(request).ConfigureAwait(false);
+                        response.EnsureSuccessStatusCode();
+                        data = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                     }
 
                     return JsonSerializer.Deserialize<WSEndpointResponse>(data, JsonHelper.DefaultJsonSerializerSettings.Value).WebSocketDebuggerUrl;
@@ -528,27 +627,6 @@ namespace PuppeteerSharp
             }
 
             return ResolveExecutablePath(options.HeadlessMode, buildId);
-        }
-
-        private string ComputeSystemExecutablePath(SupportedBrowser browser, ChromeReleaseChannel channel)
-        {
-            if (browser != SupportedBrowser.Chrome)
-            {
-                throw new PuppeteerException($"System browser detection is not supported for {browser} yet.");
-            }
-
-            var paths = Chrome.ResolveSystemExecutablePaths(BrowserFetcher.GetCurrentPlatform(), channel);
-
-            foreach (var path in paths)
-            {
-                if (File.Exists(path))
-                {
-                    return path;
-                }
-            }
-
-            throw new PuppeteerException(
-                $"Could not find Google Chrome executable for channel '{channel}' at:\n - {string.Join("\n - ", paths)}");
         }
     }
 }

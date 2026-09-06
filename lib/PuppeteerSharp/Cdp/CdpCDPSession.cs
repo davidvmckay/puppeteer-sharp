@@ -58,6 +58,9 @@ public class CdpCDPSession : CDPSession
 
     internal bool IsClosed { get; private set; }
 
+    private protected override bool BufferEarlyMessages
+        => _targetType is TargetType.ServiceWorker or TargetType.SharedWorker or TargetType.Worker;
+
     /// <inheritdoc />
     public override async Task DetachAsync()
     {
@@ -84,6 +87,11 @@ public class CdpCDPSession : CDPSession
                 $"Most likely the {_targetType} has been closed." +
                 $"Close reason: {CloseReason}",
                 CloseReason);
+        }
+
+        if (method == "Network.emulateNetworkConditions" && Connection.RejectEmulateNetworkConditionsCalls)
+        {
+            throw new PuppeteerException("Cannot reset network conditions: rule-based emulation is enabled.");
         }
 
         var id = GetMessageId();
@@ -139,10 +147,13 @@ public class CdpCDPSession : CDPSession
         }
 
         _callbacks.Clear();
+        ClearBufferedMessages();
         OnDisconnected();
     }
 
     internal bool HasPendingCallbacks() => !_callbacks.IsEmpty;
+
+    internal bool HasCallback(int id) => _callbacks.ContainsKey(id);
 
     internal List<string> GetPendingProtocolErrors()
     {

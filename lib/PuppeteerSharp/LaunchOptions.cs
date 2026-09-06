@@ -150,6 +150,17 @@ namespace PuppeteerSharp
         public WebSocketFactory WebSocketFactory { get; set; }
 
         /// <summary>
+        /// Options for the WebSocket connection to the browser.
+        /// </summary>
+        public WsOptions WsOptions { get; set; }
+
+        /// <summary>
+        /// Headers that should be sent with connection-related HTTP and WebSocket requests.
+        /// </summary>
+        [Obsolete("Use WsOptions.Headers via LaunchOptions.WsOptions instead. When both are set, WsOptions.Headers wins.")]
+        public Dictionary<string, string> Headers { get; set; }
+
+        /// <summary>
         /// Optional factory for <see cref="IConnectionTransport"/> implementations.
         /// </summary>
         public TransportFactory TransportFactory { get; set; }
@@ -228,6 +239,11 @@ namespace PuppeteerSharp
         /// <para>In Firefox, there is no known command line flag to disable addons so they are always enabled.</para>
         /// </remarks>
         public EnableExtensionsOption EnableExtensions { get; set; }
+
+        /// <summary>
+        /// Gets or sets the list of extension paths that will be enabled in Incognito and off-the-record profiles.
+        /// </summary>
+        public string[] ExtensionsEnabledInIncognito { get; set; }
 
         /// <summary>
         /// Whether to handle the DevTools windows as pages in Puppeteer. Supported only in Chrome with CDP.

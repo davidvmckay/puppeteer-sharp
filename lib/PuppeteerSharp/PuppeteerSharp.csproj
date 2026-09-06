@@ -12,10 +12,10 @@
     <Description>Headless Browser .NET API</Description>
     <PackageId>PuppeteerSharp</PackageId>
     <PackageReleaseNotes></PackageReleaseNotes>
-    <PackageVersion>24.42.0</PackageVersion>
-    <ReleaseVersion>24.42.0</ReleaseVersion>
-    <AssemblyVersion>24.42.0</AssemblyVersion>
-    <FileVersion>24.42.0</FileVersion>
+    <PackageVersion>25.10.0</PackageVersion>
+    <ReleaseVersion>25.10.0</ReleaseVersion>
+    <AssemblyVersion>25.10.0</AssemblyVersion>
+    <FileVersion>25.10.0</FileVersion>
     <SynchReleaseVersion>false</SynchReleaseVersion>
     <StyleCopTreatErrorsAsWarnings>false</StyleCopTreatErrorsAsWarnings>
     <DebugType>embedded</DebugType>
@@ -45,21 +45,23 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0" />
-    <PackageReference Include="WebDriverBiDi" Version="0.0.49" Condition=" '$(DefineConstants)' != 'CDP_ONLY' " />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+    <PackageReference Include="ReactiveExtensionsSharp" Version="0.3.0" />
+    <PackageReference Include="WebDriverBiDi" Version="0.0.54" Condition=" !$(DefineConstants.Contains('CDP_ONLY')) " />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
-    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.3" />
-    <PackageReference Include="System.Text.Json" Version="10.0.3" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.7" />
+    <PackageReference Include="System.Text.Json" Version="10.0.7" />
+    <PackageReference Include="System.Threading.Channels" Version="10.0.7" />
   </ItemGroup>
   <ItemGroup>
     <AdditionalFiles Include="..\stylecop.json" Link="stylecop.json" />
   </ItemGroup>
-  <PropertyGroup Condition=" '$(DefineConstants)' != 'CDP_ONLY' ">
+  <PropertyGroup Condition=" !$(DefineConstants.Contains('CDP_ONLY')) ">
     <ChromiumBidiVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)Bidi/chromium-bidi.version').Trim())</ChromiumBidiVersion>
     <MapperTabPath>$(MSBuildThisFileDirectory)Bidi/mapperTab.js</MapperTabPath>
   </PropertyGroup>
-  <Target Name="DownloadMapperTab" BeforeTargets="PrepareForBuild" Condition=" '$(DefineConstants)' != 'CDP_ONLY' AND !Exists('$(MapperTabPath)') ">
+  <Target Name="DownloadMapperTab" BeforeTargets="PrepareForBuild" Condition=" !$(DefineConstants.Contains('CDP_ONLY')) AND !Exists('$(MapperTabPath)') ">
     <PropertyGroup>
       <_TarballUrl>https://registry.npmjs.org/chromium-bidi/-/chromium-bidi-$(ChromiumBidiVersion).tgz</_TarballUrl>
       <_TarballPath>$(IntermediateOutputPath)chromium-bidi-$(ChromiumBidiVersion).tgz</_TarballPath>
@@ -75,7 +77,7 @@
   </Target>
   <ItemGroup>
     <EmbeddedResource Include="Injected\injected.js" />
-    <EmbeddedResource Include="Bidi\mapperTab.js" Condition=" '$(DefineConstants)' != 'CDP_ONLY' " />
+    <EmbeddedResource Include="Bidi\mapperTab.js" Condition=" !$(DefineConstants.Contains('CDP_ONLY')) " />
   </ItemGroup>
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />

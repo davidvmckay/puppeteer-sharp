@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.WebSockets;
 using PuppeteerSharp.Cdp;
 using PuppeteerSharp.Transport;
@@ -36,6 +37,17 @@ namespace PuppeteerSharp
         /// If <see cref="Transport"/> is set this property will be ignored.
         /// </summary>
         public WebSocketFactory WebSocketFactory { get; set; }
+
+        /// <summary>
+        /// Options for the WebSocket connection to the browser.
+        /// </summary>
+        public WsOptions WsOptions { get; set; }
+
+        /// <summary>
+        /// Headers that should be sent with connection-related HTTP and WebSocket requests.
+        /// </summary>
+        [Obsolete("Use WsOptions.Headers via ConnectOptions.WsOptions instead. When both are set, WsOptions.Headers wins.")]
+        public Dictionary<string, string> Headers { get; set; }
 
         /// <summary>
         /// Experimental setting to disable monitoring network events by default. When

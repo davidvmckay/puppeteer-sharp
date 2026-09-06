@@ -535,6 +535,13 @@ namespace PuppeteerSharp
         Task EmulateTimezoneAsync(string timezoneId);
 
         /// <summary>
+        /// Emulates the locale of the page.
+        /// </summary>
+        /// <param name="locale">Locale to emulate on the page (e.g., "en-US", "de-DE"). Passing <c>null</c> disables locale emulation.</param>
+        /// <returns>A task that resolves when the locale has been set.</returns>
+        Task EmulateLocaleAsync(string locale = null);
+
+        /// <summary>
         /// Simulates the given vision deficiency on the page.
         /// </summary>
         /// <example>
@@ -1017,7 +1024,19 @@ namespace PuppeteerSharp
         /// By default, all recordings will be WebM format using the VP9 video codec, with a frame rate of 30 FPS.
         /// You must have ffmpeg installed on your system.
         /// </remarks>
+        [Obsolete("Use RecordAsync instead.")]
         Task<ScreenRecorder> ScreencastAsync(ScreencastOptions options = null);
+
+        /// <summary>
+        /// Records this <see cref="IPage"/> using the Chrome DevTools Protocol
+        /// <see href="https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-startScreenRecording">Page.startScreenRecording</see> API.
+        /// </summary>
+        /// <remarks>
+        /// Outputs mp4 video stream.
+        /// </remarks>
+        /// <param name="options">Recording options.</param>
+        /// <returns>A task which resolves to a <see cref="ScreenRecording"/> that can be used to stop the recording.</returns>
+        Task<ScreenRecording> RecordAsync(RecordOptions options = null);
 
         /// <summary>
         /// Captures a screenshot of this <see cref="IPage"/>.
@@ -1120,7 +1139,18 @@ namespace PuppeteerSharp
         /// <param name="options">The navigations options.</param>
         /// <returns>Task.</returns>
         /// <seealso cref="IFrame.SetContentAsync(string, NavigationOptions)"/>
-        Task SetContentAsync(string html, NavigationOptions options = null);
+        [System.Obsolete("Use SetContentAsync(string, SetContentOptions) instead. The networkidle0 and networkidle2 wait conditions never worked reliably with SetContent.")]
+        Task SetContentAsync(string html, NavigationOptions options);
+
+        /// <summary>
+        /// Sets the HTML markup to the page.
+        /// </summary>
+        /// <param name="html">HTML markup to assign to the page.</param>
+        /// <param name="options">The options. The <see cref="WaitUntilNavigation.Networkidle0"/> and
+        /// <see cref="WaitUntilNavigation.Networkidle2"/> wait conditions are not supported for SetContent.</param>
+        /// <returns>Task.</returns>
+        /// <seealso cref="IFrame.SetContentAsync(string, SetContentOptions)"/>
+        Task SetContentAsync(string html, SetContentOptions options = null);
 
         /// <summary>
         /// Clears all of the current cookies and then sets the cookies for the page.
@@ -1583,6 +1613,13 @@ namespace PuppeteerSharp
         /// <param name="bypass">When <c>true</c> bypasses service worker.</param>
         /// <returns>A task that resolves when the message is sent to the browser.</returns>
         Task SetBypassServiceWorkerAsync(bool bypass);
+
+        /// <summary>
+        /// Triggers an extension action for the given extension.
+        /// </summary>
+        /// <param name="extension">The extension to trigger the action for.</param>
+        /// <returns>A task that completes when the extension action has been triggered.</returns>
+        Task TriggerExtensionActionAsync(Extension extension);
 
         /// <summary>
         /// Returns the extension content-script realms associated with the page's main frame.

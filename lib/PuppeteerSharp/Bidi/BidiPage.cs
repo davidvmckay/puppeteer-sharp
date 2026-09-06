@@ -30,6 +30,8 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using PuppeteerSharp.Bidi.Core;
 using PuppeteerSharp.Helpers;
 using PuppeteerSharp.Media;
@@ -239,6 +241,18 @@ public class BidiPage : Page
         => Task.FromResult(BidiMainFrame.BrowsingContext.WindowId);
 
     /// <inheritdoc />
+    public override async Task EmulateLocaleAsync(string locale = null)
+    {
+        var commandParameters = new WebDriverBiDi.Emulation.SetLocaleOverrideCommandParameters()
+        {
+            Locale = locale,
+            Contexts = [BidiMainFrame.BrowsingContext.Id],
+        };
+
+        await BidiMainFrame.BrowsingContext.Session.Driver.Emulation.SetLocaleOverrideAsync(commandParameters).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
     public override Task EmulateIdleStateAsync(EmulateIdleOverrides idleOverrides = null)
         => _cdpEmulationManager.EmulateIdleStateAsync(idleOverrides);
 
@@ -280,174 +294,6 @@ public class BidiPage : Page
         }
 
         return waitForNavigationTask.Result;
-    }
-
-    /// <inheritdoc />
-    public override async Task WaitForNetworkIdleAsync(WaitForNetworkIdleOptions options = null)
-    {
-        var timeout = options?.Timeout ?? DefaultTimeout;
-        var idleTime = options?.IdleTime ?? 500;
-        var concurrency = options?.Concurrency ?? 0;
-
-        var networkIdleTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        var idleTimer = new System.Timers.Timer { Interval = idleTime, AutoReset = false };
-
-        idleTimer.Elapsed += (_, _) => { networkIdleTcs.TrySetResult(true); };
-
-        var inflightRequests = 0;
-        var requestLock = new object();
-
-        void Evaluate()
-        {
-            idleTimer.Stop();
-
-            lock (requestLock)
-            {
-                if (inflightRequests <= concurrency)
-                {
-                    idleTimer.Start();
-                }
-            }
-        }
-
-        void RequestEventListener(object sender, RequestEventArgs e)
-        {
-            lock (requestLock)
-            {
-                inflightRequests++;
-            }
-
-            Evaluate();
-        }
-
-        void RequestFinishedEventListener(object sender, RequestEventArgs e)
-        {
-            lock (requestLock)
-            {
-                inflightRequests = Math.Max(0, inflightRequests - 1);
-            }
-
-            Evaluate();
-        }
-
-        void ResponseEventListener(object sender, ResponseCreatedEventArgs e)
-        {
-            lock (requestLock)
-            {
-                inflightRequests = Math.Max(0, inflightRequests - 1);
-            }
-
-            Evaluate();
-        }
-
-        void Cleanup()
-        {
-            idleTimer.Stop();
-            idleTimer.Dispose();
-
-            Request -= RequestEventListener;
-            RequestFinished -= RequestFinishedEventListener;
-            RequestFailed -= RequestFinishedEventListener;
-            Response -= ResponseEventListener;
-        }
-
-        Request += RequestEventListener;
-        RequestFinished += RequestFinishedEventListener;
-        RequestFailed += RequestFinishedEventListener;
-        Response += ResponseEventListener;
-
-        Evaluate();
-
-        await Task.WhenAny(networkIdleTcs.Task, ClosedTask).WithTimeout(timeout, t =>
-        {
-            Cleanup();
-
-            return new TimeoutException($"Timeout of {t.TotalMilliseconds} ms exceeded");
-        }).ConfigureAwait(false);
-
-        Cleanup();
-
-        if (ClosedTask.IsFaulted)
-        {
-            await ClosedTask.ConfigureAwait(false);
-        }
-    }
-
-    /// <inheritdoc />
-    public override async Task<IRequest> WaitForRequestAsync(Func<IRequest, bool> predicate, WaitForOptions options = null)
-    {
-        var timeout = options?.Timeout ?? DefaultTimeout;
-        var requestTcs = new TaskCompletionSource<IRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        void RequestEventListener(object sender, RequestEventArgs e)
-        {
-            if (predicate(e.Request))
-            {
-                requestTcs.TrySetResult(e.Request);
-                Request -= RequestEventListener;
-            }
-        }
-
-        Request += RequestEventListener;
-
-        try
-        {
-            await Task.WhenAny(requestTcs.Task, ClosedTask).WithTimeout(timeout, t =>
-                new TimeoutException($"Timeout of {t.TotalMilliseconds} ms exceeded")).ConfigureAwait(false);
-
-            if (ClosedTask.IsFaulted)
-            {
-                await ClosedTask.ConfigureAwait(false);
-            }
-
-            return await requestTcs.Task.ConfigureAwait(false);
-        }
-        finally
-        {
-            Request -= RequestEventListener;
-        }
-    }
-
-    /// <inheritdoc />
-    public override async Task<IResponse> WaitForResponseAsync(Func<IResponse, Task<bool>> predicate, WaitForOptions options = null)
-    {
-        var timeout = options?.Timeout ?? DefaultTimeout;
-        var responseTcs = new TaskCompletionSource<IResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        async void ResponseHandler(object sender, ResponseCreatedEventArgs e)
-        {
-            try
-            {
-                if (await predicate(e.Response).ConfigureAwait(false))
-                {
-                    responseTcs.TrySetResult(e.Response);
-                }
-            }
-            catch (Exception ex)
-            {
-                responseTcs.TrySetException(ex);
-            }
-        }
-
-        Response += ResponseHandler;
-
-        try
-        {
-            await Task.WhenAny(responseTcs.Task, ClosedTask).WithTimeout(timeout, t =>
-                new TimeoutException($"Timeout of {t.TotalMilliseconds} ms exceeded")).ConfigureAwait(false);
-
-            if (ClosedTask.IsFaulted)
-            {
-                await ClosedTask.ConfigureAwait(false);
-            }
-
-            return await responseTcs.Task.ConfigureAwait(false);
-        }
-        finally
-        {
-            Response -= ResponseHandler;
-        }
     }
 
     /// <inheritdoc />
@@ -496,63 +342,6 @@ public class BidiPage : Page
 
     /// <inheritdoc />
     public override Task SetBurstModeOffAsync() => throw new NotImplementedException();
-
-    /// <inheritdoc />
-    public override async Task<IFrame> WaitForFrameAsync(Func<IFrame, bool> predicate, WaitForOptions options = null)
-    {
-        if (predicate == null)
-        {
-            throw new ArgumentNullException(nameof(predicate));
-        }
-
-        var timeout = options?.Timeout ?? DefaultTimeout;
-        var frameTcs = new TaskCompletionSource<IFrame>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        void FrameNavigatedEventListener(object sender, FrameNavigatedEventArgs e)
-        {
-            if (predicate(e.Frame))
-            {
-                frameTcs.TrySetResult(e.Frame);
-                FrameNavigated -= FrameNavigatedEventListener;
-            }
-        }
-
-        void FrameAttachedEventListener(object sender, FrameEventArgs e)
-        {
-            if (predicate(e.Frame))
-            {
-                frameTcs.TrySetResult(e.Frame);
-                FrameAttached -= FrameAttachedEventListener;
-            }
-        }
-
-        FrameAttached += FrameAttachedEventListener;
-        FrameNavigated += FrameNavigatedEventListener;
-
-        var eventRace = Task.WhenAny(frameTcs.Task, ClosedTask).WithTimeout(timeout, t =>
-        {
-            FrameAttached -= FrameAttachedEventListener;
-            FrameNavigated -= FrameNavigatedEventListener;
-            return new TimeoutException($"Timeout of {t.TotalMilliseconds} ms exceeded");
-        });
-
-        foreach (var frame in Frames)
-        {
-            if (predicate(frame))
-            {
-                return frame;
-            }
-        }
-
-        await eventRace.ConfigureAwait(false);
-
-        if (ClosedTask.IsFaulted)
-        {
-            await ClosedTask.ConfigureAwait(false);
-        }
-
-        return await frameTcs.Task.ConfigureAwait(false);
-    }
 
     /// <inheritdoc />
     public override async Task SetGeolocationAsync(GeolocationOption options)
@@ -879,6 +668,10 @@ public class BidiPage : Page
 
     /// <inheritdoc />
     public override Task SetBypassServiceWorkerAsync(bool bypass) => throw new NotImplementedException();
+
+    /// <inheritdoc />
+    public override Task TriggerExtensionActionAsync(Extension extension)
+        => throw new NotSupportedException("TriggerExtensionAction is not supported in WebDriver BiDi.");
 
     /// <inheritdoc />
     public override IReadOnlyList<Realm> ExtensionRealms()
@@ -1311,6 +1104,13 @@ public class BidiPage : Page
     /// <inheritdoc />
     protected override Task ExposeFunctionAsync(string name, Delegate puppeteerFunction)
         => BidiMainFrame.ExposeFunctionAsync(name, puppeteerFunction);
+
+    /// <inheritdoc/>
+    protected override ScreenRecording CreateScreenRecording(RecordOptions options)
+    {
+        var logger = BidiBrowser.LoggerFactory?.CreateLogger<ScreenRecording>() ?? NullLogger<ScreenRecording>.Instance;
+        return new BidiScreenRecording(this, options, logger);
+    }
 
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)

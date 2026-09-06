@@ -39,7 +39,6 @@ internal class BrowsingContext : IDisposable
     private readonly ConcurrentDictionary<string, BrowsingContext> _children = new();
     private readonly List<string> _childrenOrder = new();
     private readonly object _childrenLock = new();
-    private readonly ConcurrentDictionary<string, Request> _requests = new();
     private string _reason;
     private Navigation _navigation;
 
@@ -254,6 +253,15 @@ internal class BrowsingContext : IDisposable
         return result.InterceptId;
     }
 
+    internal async Task<StartScreencastCommandResult> StartScreencastAsync(StartScreencastCommandParameters options)
+    {
+        options.Context = Id;
+        return await Session.Driver.ExecuteCommandAsync(options).ConfigureAwait(false);
+    }
+
+    internal async Task<StopScreencastCommandResult> StopScreencastAsync(string screencast)
+        => await Session.Driver.ExecuteCommandAsync(new StopScreencastCommandParameters(screencast)).ConfigureAwait(false);
+
     internal async Task SetUserAgentAsync(string userAgent)
     {
         var parameters = new SetUserAgentOverrideCommandParameters
@@ -382,14 +390,6 @@ internal class BrowsingContext : IDisposable
                 return;
             }
 
-            foreach (var entry in _requests)
-            {
-                if (entry.Value.IsDisposed)
-                {
-                    _requests.TryRemove(entry.Key, out _);
-                }
-            }
-
             // Dispose old navigation if exists - a new navigation has started
             _navigation?.Dispose();
 
@@ -421,13 +421,14 @@ internal class BrowsingContext : IDisposable
                 return;
             }
 
-            if (_requests.ContainsKey(args.Request.RequestId))
+            if (args.RedirectCount > 0)
             {
+                // Means the request is a redirect. This is handled in Request.
+                // Or an Auth event was issued
                 return;
             }
 
             var request = Core.Request.From(this, args);
-            _requests.TryAdd(args.Request.RequestId, request);
             Request?.Invoke(this, new RequestEventArgs(request));
         };
 

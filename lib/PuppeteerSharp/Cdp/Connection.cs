@@ -99,6 +99,8 @@ namespace PuppeteerSharp.Cdp
 
         internal int ProtocolTimeout { get; }
 
+        internal bool RejectEmulateNetworkConditionsCalls { get; set; }
+
         /// <inheritdoc />
         public void Dispose()
         {
@@ -112,6 +114,11 @@ namespace PuppeteerSharp.Cdp
             if (IsClosed)
             {
                 throw new TargetClosedException($"Protocol error({method}): Target closed.", CloseReason);
+            }
+
+            if (method == "Network.emulateNetworkConditions" && RejectEmulateNetworkConditionsCalls)
+            {
+                throw new PuppeteerException("Cannot reset network conditions: rule-based emulation is enabled.");
             }
 
             var id = GetMessageId();
@@ -129,7 +136,18 @@ namespace PuppeteerSharp.Cdp
                 _callbacks[id] = callback;
             }
 
-            await RawSendAsync(message, options).ConfigureAwait(false);
+            try
+            {
+                await RawSendAsync(message, options).ConfigureAwait(false);
+            }
+            catch (System.Net.WebSockets.WebSocketException)
+            {
+                // The WebSocket was aborted (e.g. Chrome exited) between the IsClosed check and the send.
+                // Treat this as a closed connection so callers get TargetClosedException instead.
+                Close("WebSocket error");
+                throw new TargetClosedException($"Protocol error({method}): Target closed.", CloseReason);
+            }
+
             return waitForCallback ? await callback.TaskWrapper.Task.WithTimeout(ProtocolTimeout).ConfigureAwait(false) : null;
         }
 
@@ -367,6 +385,20 @@ namespace PuppeteerSharp.Cdp
                 if (_callbacks.TryRemove(obj.Id.Value, out var callback))
                 {
                     MessageQueue.Enqueue(callback, obj);
+                }
+                else
+                {
+                    // Chrome can occasionally omit the sessionId on responses. Fall back
+                    // to a per-session callback lookup so the response is routed to the
+                    // session that originally issued the command (upstream #14975).
+                    foreach (var session in _sessions.Values)
+                    {
+                        if (session.HasCallback(obj.Id.Value))
+                        {
+                            session.OnMessage(obj);
+                            break;
+                        }
+                    }
                 }
             }
             else
